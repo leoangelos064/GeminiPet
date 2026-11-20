@@ -46,11 +46,11 @@ enum PetSizePreset: CGFloat, CaseIterable {
 
     var title: String {
         switch self {
-        case .xs: return "超小 (80px)"
-        case .sm: return "偏小 (96px)"
-        case .gptDefault: return "GPT 默认同款 (112px)"
-        case .md: return "偏大 (136px)"
-        case .lg: return "大号 (164px)"
+        case .xs: return "80px"
+        case .sm: return "96px"
+        case .gptDefault: return "112px"
+        case .md: return "136px"
+        case .lg: return "164px"
         }
     }
 }
@@ -62,8 +62,8 @@ enum MotionStyle: String, CaseIterable {
 
     var title: String {
         switch self {
-        case .calm: return "克制微动（推荐）"
-        case .still: return "完全静态（减少动态）"
+        case .calm: return "克制微动"
+        case .still: return "完全静态"
         case .lively: return "活泼动画"
         }
     }
@@ -75,15 +75,15 @@ enum AIModelPreset: String, CaseIterable {
 
     var title: String {
         switch self {
-        case .fast: return "极速响应 (Flash Lite)"
-        case .smart: return "深度思考 (Gemini 4)"
+        case .fast: return "极速 (Flash Lite)"
+        case .smart: return "深度 (Gemini 4)"
         }
     }
 }
 
 enum ActivePanelMode: Equatable {
     case none
-    case workspace   // Unified Task Group + Inline Conversation / Modify (ChatGPT Pet style)
+    case workspace
     case voice
 }
 
@@ -128,7 +128,6 @@ struct AgyTasksFile: Decodable {
     let tasks: [AgyTaskRecord]
 }
 
-/// Unified Task / Conversation Thread (represents either a live Antigravity task or a Pet quick-chat thread)
 struct PetTaskThread: Identifiable {
     let id: String
     let isAntigravity: Bool
@@ -292,6 +291,45 @@ final class VoiceController: NSObject, ObservableObject, AVAudioPlayerDelegate {
     }
 }
 
+// MARK: - LaunchAtLogin Helper (LaunchAgent)
+
+enum LaunchAgentHelper {
+    private static var plistURL: URL {
+        FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/LaunchAgents/com.antigravity.geminipet.plist")
+    }
+
+    static var isEnabled: Bool {
+        FileManager.default.fileExists(atPath: plistURL.path)
+    }
+
+    static func setEnabled(_ enabled: Bool) {
+        if enabled {
+            let appExec = Bundle.main.executablePath ?? "/Applications/GeminiPet.app/Contents/MacOS/GeminiPet"
+            let plist = """
+            <?xml version="1.0" encoding="UTF-8"?>
+            <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+            <plist version="1.0">
+            <dict>
+                <key>Label</key>
+                <string>com.antigravity.geminipet</string>
+                <key>ProgramArguments</key>
+                <array>
+                    <string>\(appExec)</string>
+                </array>
+                <key>RunAtLoad</key>
+                <true/>
+            </dict>
+            </plist>
+            """
+            try? FileManager.default.createDirectory(at: plistURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try? plist.write(to: plistURL, atomically: true, encoding: .utf8)
+        } else {
+            try? FileManager.default.removeItem(at: plistURL)
+        }
+    }
+}
+
 // MARK: - Pet ViewModel
 
 @MainActor
@@ -302,9 +340,6 @@ final class PetViewModel: ObservableObject {
         didSet { onPanelModeChanged?(activePanel) }
     }
     @Published var miniMode: Bool = false {
-        didSet { onSizeChanged?() }
-    }
-    @Published var alwaysShowTaskBar: Bool = true {
         didSet { onSizeChanged?() }
     }
     @Published var isFacingLeft: Bool = false
@@ -319,15 +354,20 @@ final class PetViewModel: ObservableObject {
     }
     @Published var wanderEnabled: Bool = false
     @Published var agySyncEnabled: Bool = true
+    @Published var showTaskBanner: Bool = true
+    @Published var launchAtLogin: Bool = LaunchAgentHelper.isEnabled {
+        didSet { LaunchAgentHelper.setEnabled(launchAtLogin) }
+    }
     @Published var isVisible: Bool = true
 
-    // Unified Multi-Task Group State (Antigravity live tasks + Pet chat threads)
+    // Unified Task Group
     @Published var tasks: [PetTaskThread] = []
     @Published var selectedTaskId: String = ""
     @Published var inputText: String = ""
     @Published var attachedScreenPath: String? = nil
     @Published var voiceStatusHint: String = "点击麦克风开始说话"
     @Published var quickToast: String? = nil
+    @Published var bannerDismissedByUser: Bool = false
     @Published var focusInputTrigger: UUID = UUID()
     @Published var nowTick: Date = Date()
 
@@ -343,6 +383,7 @@ final class PetViewModel: ObservableObject {
     private var lastInteractionDate = Date()
     private var recentPokeTimestamps: [Date] = []
     private var toastDismissTask: Task<Void, Never>?
+    private var doneAutoHideTask: Task<Void, Never>?
     private var hoverHideTask: Task<Void, Never>?
     private var moodResetTask: Task<Void, Never>?
     private var tickTimer: Timer?
@@ -352,21 +393,20 @@ final class PetViewModel: ObservableObject {
     private var isDragging = false
     private var voiceCancellable: AnyCancellable?
 
-    private let happyLines = ["呼噜~ ✦", "摸摸头 💗", "在呢喵~", "随时待命 ✦"]
+    private let happyLines = ["呼噜~ ✦", "摸摸头 💗", "在呢喵~"]
     private let hissLines = ["哈——！💢", "别一直戳啦！", "炸毛了喵 💢"]
 
     init() {
         loadSprites()
-        // Seed one default Pet chat thread so the task group always has a ready workspace
         let defaultId = "pet-main"
         tasks = [
             PetTaskThread(
                 id: defaultId,
                 isAntigravity: false,
                 title: "快捷对话",
-                workspace: "哈基米工作区",
+                workspace: "哈基米",
                 state: .idle,
-                currentAction: "空闲待命中",
+                currentAction: "",
                 startedAt: Date(),
                 updatedAt: Date(),
                 steps: [],
@@ -392,18 +432,16 @@ final class PetViewModel: ObservableObject {
         tasks.filter { $0.unread }.count
     }
 
-    /// Primary task displayed in the persistent top Task & Workspace strip
-    var bannerTask: PetTaskThread? {
+    /// Active task to show in the compact top strip (ONLY while running or freshly completed/unread!)
+    var activeBannerTask: PetTaskThread? {
+        guard showTaskBanner && !bannerDismissedByUser else { return nil }
         if let running = tasks.first(where: { $0.state == .running }) {
             return running
         }
         if let unreadTask = tasks.first(where: { $0.unread }) {
             return unreadTask
         }
-        if let selected = tasks.first(where: { $0.id == selectedTaskId }) {
-            return selected
-        }
-        return tasks.first
+        return nil
     }
 
     var selectedTask: PetTaskThread? {
@@ -412,6 +450,29 @@ final class PetViewModel: ObservableObject {
 
     var isAnyTaskThinking: Bool {
         runningTasksCount > 0
+    }
+
+    func dismissTopBanner() {
+        bannerDismissedByUser = true
+        for idx in tasks.indices where tasks[idx].unread {
+            tasks[idx].unread = false
+        }
+        quickToast = nil
+    }
+
+    private func scheduleDoneBannerAutoHide() {
+        doneAutoHideTask?.cancel()
+        doneAutoHideTask = Task { [weak self] in
+            // After a task finishes, keep the subtle "已完成" pill for 12s (or until user clicks / closes), then vanish cleanly!
+            try? await Task.sleep(nanoseconds: 12_000_000_000)
+            guard !Task.isCancelled else { return }
+            await MainActor.run {
+                guard let self, self.runningTasksCount == 0 else { return }
+                for idx in self.tasks.indices where self.tasks[idx].unread {
+                    self.tasks[idx].unread = false
+                }
+            }
+        }
     }
 
     private func loadSprites() {
@@ -457,7 +518,6 @@ final class PetViewModel: ObservableObject {
         tickCount += 1
         let now = Date()
 
-        // Update elapsed timer display every 1s when any task is running
         if tickCount % 10 == 0 && runningTasksCount > 0 {
             nowTick = now
         }
@@ -492,7 +552,6 @@ final class PetViewModel: ObservableObject {
             }
         }
 
-        // Poll Antigravity multi-task registry every 0.4s
         if agySyncEnabled && tickCount % 4 == 0 {
             pollAgyTasks(initialLoad: false)
         }
@@ -573,7 +632,6 @@ final class PetViewModel: ObservableObject {
             }
         }
 
-        // Keep running tasks at the front, then sorted by updatedAt descending
         tasks.sort { lhs, rhs in
             if (lhs.state == .running) != (rhs.state == .running) {
                 return lhs.state == .running
@@ -584,11 +642,17 @@ final class PetViewModel: ObservableObject {
         if !initialLoad {
             lastInteractionDate = Date()
             if sawNewlyRunning {
+                bannerDismissedByUser = false
+                doneAutoHideTask?.cancel()
                 setMood(.working, autoResetAfter: nil)
             } else if sawNewlyError {
+                bannerDismissedByUser = false
+                scheduleDoneBannerAutoHide()
                 setMood(.hiss, autoResetAfter: 4.0)
             } else if sawNewlyDone {
-                setMood(.happy, autoResetAfter: 4.0)
+                bannerDismissedByUser = false
+                scheduleDoneBannerAutoHide()
+                setMood(.happy, autoResetAfter: 3.5)
             } else if runningTasksCount == 0 && mood == .working {
                 setMood(.idle, autoResetAfter: nil)
             }
@@ -611,10 +675,10 @@ final class PetViewModel: ObservableObject {
         let thread = PetTaskThread(
             id: newId,
             isAntigravity: false,
-            title: "新任务 #\(count)",
-            workspace: "哈基米工作区",
+            title: "新对话 #\(count)",
+            workspace: "哈基米",
             state: .idle,
-            currentAction: "等待输入指令",
+            currentAction: "",
             startedAt: Date(),
             updatedAt: Date(),
             steps: [],
@@ -633,7 +697,7 @@ final class PetViewModel: ObservableObject {
         lastInteractionDate = Date()
         if let tid = focusTaskId {
             selectTask(tid)
-        } else if let bt = bannerTask {
+        } else if let bt = activeBannerTask {
             selectTask(bt.id)
         }
         if activePanel == .workspace && focusTaskId == nil {
@@ -683,18 +747,7 @@ final class PetViewModel: ObservableObject {
         }
     }
 
-    // MARK: - Inline Send / Modify Inside Selected Task
-
-    func sendModifyToAntigravity() {
-        let text = inputText.trimmingCharacters(in: .whitespacesAndNewlines)
-        if !text.isEmpty {
-            NSPasteboard.general.clearContents()
-            NSPasteboard.general.setString(text, forType: .string)
-            inputText = ""
-            showToast("已复制修改指令，正在切回 Antigravity 粘贴 ✦")
-        }
-        openApp(named: "/Applications/Antigravity.app")
-    }
+    // MARK: - Inline Send / Modify
 
     func sendTextPrompt() {
         let text = inputText.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -709,9 +762,8 @@ final class PetViewModel: ObservableObject {
         let taskId = tasks[taskIdx].id
         let displayPrompt = text.isEmpty ? "看看我当前屏幕里的内容" : text
 
-        // Update title on first prompt of a fresh pet thread
         if !tasks[taskIdx].isAntigravity && tasks[taskIdx].messages.isEmpty {
-            let short = displayPrompt.count > 20 ? String(displayPrompt.prefix(20)) + "…" : displayPrompt
+            let short = displayPrompt.count > 16 ? String(displayPrompt.prefix(16)) + "…" : displayPrompt
             tasks[taskIdx].title = short
         }
 
@@ -719,14 +771,12 @@ final class PetViewModel: ObservableObject {
         inputText = ""
         attachedScreenPath = nil
 
-        // If user is modifying/following up on an Antigravity task right inside this conversation,
-        // automatically inject that task's context on the first follow-up turn!
         var effectivePrompt = text
         if tasks[taskIdx].isAntigravity && tasks[taskIdx].interactionId.isEmpty {
             let ctxSummary = tasks[taskIdx].agyLastReply.isEmpty
                 ? tasks[taskIdx].currentAction
                 : String(tasks[taskIdx].agyLastReply.prefix(320))
-            effectivePrompt = "【当前工作区：\(tasks[taskIdx].workspace)｜当前任务：\(tasks[taskIdx].title)｜最新进展：\(ctxSummary)】\n用户追加修改/追问：\(displayPrompt)"
+            effectivePrompt = "【工作区：\(tasks[taskIdx].workspace)｜任务：\(tasks[taskIdx].title)｜最新进展：\(ctxSummary)】\n用户修改/追问：\(displayPrompt)"
         }
 
         callBridge(forTaskId: taskId, prompt: effectivePrompt, audioPath: nil, imagePath: imgPath, speak: false)
@@ -751,7 +801,7 @@ final class PetViewModel: ObservableObject {
             voice.startRecording { [weak self] ok, err in
                 guard let self else { return }
                 if ok {
-                    self.voiceStatusHint = "正在聆听… 说完点「停止并发送」"
+                    self.voiceStatusHint = "正在聆听… 说完点停止"
                     self.showToast("聆听中… 🎙")
                 } else {
                     self.voiceStatusHint = err ?? "无法开启麦克风"
@@ -762,13 +812,16 @@ final class PetViewModel: ObservableObject {
     }
 
     private func callBridge(forTaskId taskId: String, prompt: String, audioPath: String?, imagePath: String?, speak: Bool) {
+        bannerDismissedByUser = false
+        doneAutoHideTask?.cancel()
+
         let prevId: String
         if let idx = tasks.firstIndex(where: { $0.id == taskId }) {
             prevId = tasks[idx].interactionId
             tasks[idx].state = .running
             tasks[idx].startedAt = Date()
             tasks[idx].updatedAt = Date()
-            tasks[idx].currentAction = speak ? "理解语音并生成回复…" : "思考与处理修改中…"
+            tasks[idx].currentAction = speak ? "思考语音回复…" : "思考中…"
         } else {
             prevId = ""
         }
@@ -824,20 +877,21 @@ final class PetViewModel: ObservableObject {
                     }
                     self.tasks[idx].messages.append(ChatEntry(isUser: false, text: reply, hasImage: false, isVoice: speak, time: Date()))
                     self.tasks[idx].state = .done
-                    self.tasks[idx].currentAction = "已完成 · 可继续修改"
+                    self.tasks[idx].currentAction = "已完成"
                     if self.activePanel == .none || self.selectedTaskId != taskId {
                         self.tasks[idx].unread = true
+                        self.scheduleDoneBannerAutoHide()
                     }
-                    self.setMood(.happy, autoResetAfter: 3.5)
+                    self.setMood(.happy, autoResetAfter: 3.0)
                     if speak {
-                        self.voiceStatusHint = "正在播报回复（可随时打断再说）"
+                        self.voiceStatusHint = "正在播报回复"
                         self.voice.playAudioOrSpeak(audioPath: parsed.audio_path, fallbackText: reply)
                     }
                 } else {
                     let err = parsed.error ?? "未知错误"
                     self.tasks[idx].messages.append(ChatEntry(isUser: false, text: "出错啦：\(err)", hasImage: false, isVoice: false, time: Date()))
                     self.tasks[idx].state = .error
-                    self.tasks[idx].currentAction = "执行出错"
+                    self.tasks[idx].currentAction = "出错"
                     self.voiceStatusHint = "出错：\(err)"
                     self.setMood(.hiss, autoResetAfter: 3.5)
                 }
@@ -857,7 +911,7 @@ final class PetViewModel: ObservableObject {
             proc.waitUntilExit()
             if proc.terminationStatus == 0 && FileManager.default.fileExists(atPath: outURL.path) {
                 attachedScreenPath = outURL.path
-                showToast("已附带当前屏幕 📸")
+                showToast("已截取屏幕 📸")
                 if activePanel == .none {
                     activePanel = .workspace
                     focusInputTrigger = UUID()
@@ -877,7 +931,19 @@ final class PetViewModel: ObservableObject {
         attachedScreenPath = nil
     }
 
-    // MARK: - Click / Drag / Toast
+    // MARK: - Click / Drag / Mood
+
+    func selectManualMood(_ newMood: PetMood) {
+        lastInteractionDate = Date()
+        switch newMood {
+        case .idle: setMood(.idle, autoResetAfter: nil)
+        case .happy: setMood(.happy, autoResetAfter: 3.0)
+        case .working: setMood(.working, autoResetAfter: nil)
+        case .hiss: setMood(.hiss, autoResetAfter: 3.0)
+        case .sleep: setMood(.sleep, autoResetAfter: nil)
+        case .drag: setMood(.drag, autoResetAfter: 2.5)
+        }
+    }
 
     func handleSingleClick() {
         lastInteractionDate = Date()
@@ -898,7 +964,7 @@ final class PetViewModel: ObservableObject {
             return
         }
 
-        if runningTasksCount > 0 {
+        if runningTasksCount > 0 || unreadCount > 0 {
             openWorkspacePanel()
             return
         }
@@ -981,7 +1047,7 @@ final class PetViewModel: ObservableObject {
     }
 }
 
-// MARK: - Floating Pet View (Persistent Workspace/Task Bar + Pet + Hover Controls)
+// MARK: - Floating Pet View (Clean Single-Line Active Task Pill + Pet + Hover Controls)
 
 struct PetContentView: View {
     @ObservedObject var vm: PetViewModel
@@ -989,104 +1055,100 @@ struct PetContentView: View {
 
     var body: some View {
         let s = vm.petSize.rawValue
-        let showControls = vm.isHovering || vm.activePanel != .none || vm.voice.isRecording || vm.miniMode || vm.runningTasksCount > 0
-        let showTopStrip = vm.alwaysShowTaskBar || vm.runningTasksCount > 0 || vm.unreadCount > 0 || vm.quickToast != nil
+        let showControls = vm.isHovering || vm.activePanel != .none || vm.voice.isRecording || vm.miniMode
 
         TimelineView(.animation(minimumInterval: vm.motionStyle == .still ? 0.25 : 1.0 / 24.0)) { timeline in
             let t = timeline.date.timeIntervalSinceReferenceDate
             let anim = computeAnimation(t: t, mood: vm.mood, style: vm.motionStyle)
 
-            VStack(spacing: 4) {
-                // 1. PERSISTENT TOP WORKSPACE & TASK BAR (ChatGPT Pet style — stays visible while working!)
+            VStack(spacing: 3) {
+                // 1. ULTRA-CLEAN SINGLE-LINE TASK PILL (Only shown when running / just finished / toast, with ✕ close!)
                 ZStack {
-                    if showTopStrip, let bt = vm.bannerTask {
-                        Button {
-                            vm.openWorkspacePanel(focusTaskId: bt.id)
-                        } label: {
-                            VStack(alignment: .leading, spacing: 2.5) {
-                                // Row 1: Workspace Name + Task Group Counter Badge
-                                HStack(spacing: 5) {
-                                    Image(systemName: bt.isAntigravity ? "folder.fill" : "sparkles")
-                                        .font(.system(size: 8.5, weight: .semibold))
-                                        .foregroundColor(Color(red: 0.68, green: 0.74, blue: 1.0))
-                                    Text(bt.workspace)
-                                        .font(.system(size: 9.5, weight: .semibold, design: .rounded))
-                                        .foregroundColor(.white.opacity(0.75))
-                                        .lineLimit(1)
-                                    Spacer(minLength: 4)
-
-                                    // Task group pill
-                                    HStack(spacing: 3) {
-                                        if vm.runningTasksCount > 0 {
-                                            Circle()
-                                                .fill(Color(red: 0.38, green: 0.78, blue: 1.0))
-                                                .frame(width: 5.5, height: 5.5)
-                                                .opacity(0.65 + sin(t * 5.0) * 0.35)
-                                            Text("运行 \(vm.runningTasksCount)/\(vm.tasks.count)")
-                                        } else if vm.unreadCount > 0 {
-                                            Circle()
-                                                .fill(Color(red: 1.0, green: 0.78, blue: 0.32))
-                                                .frame(width: 5.5, height: 5.5)
-                                            Text("新完成 \(vm.unreadCount)")
-                                        } else {
-                                            Text("任务组 \(vm.tasks.count)")
-                                        }
-                                    }
-                                    .font(.system(size: 9, weight: .medium, design: .rounded))
-                                    .foregroundColor(.white.opacity(0.86))
-                                    .padding(.horizontal, 5.5)
-                                    .padding(.vertical, 1.5)
-                                    .background(Capsule().fill(Color.white.opacity(0.11)))
-                                }
-
-                                // Row 2: Active Task / Step / Toast + Live Elapsed Timer
+                    if vm.activePanel == .none, let bt = vm.activeBannerTask {
+                        HStack(spacing: 5) {
+                            Button {
+                                vm.openWorkspacePanel(focusTaskId: bt.id)
+                            } label: {
                                 HStack(spacing: 5) {
                                     Circle()
                                         .fill(taskDotColor(bt.state))
                                         .frame(width: 6, height: 6)
-                                        .scaleEffect(bt.state == .running ? (1.0 + sin(t * 6.0) * 0.2) : 1.0)
+                                        .scaleEffect(bt.state == .running ? (1.0 + sin(t * 5.5) * 0.2) : 1.0)
 
-                                    Text(vm.quickToast ?? (bt.state == .running ? bt.currentAction : bt.title))
+                                    Text(bt.state == .running
+                                         ? "\(bt.workspace) · \(bt.currentAction)"
+                                         : "已完成 · \(bt.title)")
                                         .font(.system(size: 10.5, weight: .medium, design: .rounded))
-                                        .foregroundColor(.white.opacity(0.95))
+                                        .foregroundColor(.white.opacity(0.94))
                                         .lineLimit(1)
-
-                                    Spacer(minLength: 2)
 
                                     if bt.state == .running {
                                         Text(vm.elapsedString(since: bt.startedAt))
-                                            .font(.system(size: 9.5, weight: .medium, design: .monospaced))
+                                            .font(.system(size: 9.5, design: .monospaced))
                                             .foregroundColor(Color(red: 0.62, green: 0.84, blue: 1.0))
-                                    } else {
-                                        Image(systemName: "chevron.up.chevron.down")
-                                            .font(.system(size: 8.5, weight: .semibold))
-                                            .foregroundColor(.white.opacity(0.42))
+                                    }
+
+                                    if vm.runningTasksCount > 1 {
+                                        Text("+\(vm.runningTasksCount - 1)")
+                                            .font(.system(size: 9, weight: .semibold))
+                                            .foregroundColor(.white.opacity(0.85))
+                                            .padding(.horizontal, 4)
+                                            .padding(.vertical, 1)
+                                            .background(Capsule().fill(Color.white.opacity(0.14)))
                                     }
                                 }
                             }
-                            .padding(.horizontal, 9)
-                            .padding(.vertical, 6)
-                            .frame(width: 196)
-                            .background(
-                                RoundedRectangle(cornerRadius: 11, style: .continuous)
-                                    .fill(Color(red: 0.10, green: 0.09, blue: 0.18).opacity(0.90))
-                                    .overlay(
-                                        RoundedRectangle(cornerRadius: 11, style: .continuous)
-                                            .strokeBorder(
-                                                bt.state == .running
-                                                    ? Color(red: 0.48, green: 0.74, blue: 1.0).opacity(0.65)
-                                                    : Color(red: 0.62, green: 0.58, blue: 1.0).opacity(0.38),
-                                                lineWidth: 0.9
-                                            )
-                                    )
-                                    .shadow(color: .black.opacity(0.26), radius: 6, y: 2)
-                            )
+                            .buttonStyle(.plain)
+                            .help("点击查看或直接修改")
+
+                            Button {
+                                vm.dismissTopBanner()
+                            } label: {
+                                Image(systemName: "xmark")
+                                    .font(.system(size: 8.5, weight: .bold))
+                                    .foregroundColor(.white.opacity(0.55))
+                                    .frame(width: 15, height: 15)
+                                    .contentShape(Rectangle())
+                            }
+                            .buttonStyle(.plain)
+                            .help("关闭任务提示")
                         }
-                        .buttonStyle(.plain)
-                        .help("点击展开任务组与对话修改")
+                        .padding(.leading, 9)
+                        .padding(.trailing, 6)
+                        .padding(.vertical, 5)
+                        .frame(maxWidth: 204)
+                        .background(
+                            Capsule()
+                                .fill(Color(red: 0.10, green: 0.09, blue: 0.18).opacity(0.90))
+                                .overlay(
+                                    Capsule()
+                                        .strokeBorder(
+                                            bt.state == .running
+                                                ? Color(red: 0.48, green: 0.74, blue: 1.0).opacity(0.6)
+                                                : Color(red: 0.45, green: 0.88, blue: 0.66).opacity(0.5),
+                                            lineWidth: 0.85
+                                        )
+                                )
+                                .shadow(color: .black.opacity(0.24), radius: 5, y: 2)
+                        )
+                        .transition(.opacity.combined(with: .scale(scale: 0.94)))
+                    } else if vm.activePanel == .none, let toast = vm.quickToast {
+                        Text(toast)
+                            .font(.system(size: 10.5, weight: .medium, design: .rounded))
+                            .foregroundColor(.white.opacity(0.94))
+                            .lineLimit(1)
+                            .padding(.horizontal, 9)
+                            .padding(.vertical, 4)
+                            .background(
+                                Capsule()
+                                    .fill(Color(red: 0.10, green: 0.09, blue: 0.18).opacity(0.88))
+                                    .overlay(Capsule().strokeBorder(Color(red: 0.62, green: 0.58, blue: 1.0).opacity(0.4), lineWidth: 0.8))
+                                    .shadow(color: .black.opacity(0.22), radius: 4, y: 2)
+                            )
+                            .transition(.opacity)
                     }
                 }
-                .frame(height: 44, alignment: .bottom)
+                .frame(height: 28, alignment: .bottom)
 
                 // 2. PET SPRITE
                 if !vm.miniMode {
@@ -1120,7 +1182,7 @@ struct PetContentView: View {
                     )
                 }
 
-                // 3. ATTACHED BOTTOM QUICK BAR (Stays visible while hovered, working, or in Mini Mode)
+                // 3. CLEAN HOVER CONTROLS (or Mini Mode bar)
                 ZStack {
                     if showControls {
                         HStack(spacing: 4) {
@@ -1146,7 +1208,7 @@ struct PetContentView: View {
                                 systemName: "text.bubble.fill",
                                 isActive: vm.activePanel == .workspace,
                                 tint: Color(red: 0.56, green: 0.52, blue: 1.0),
-                                helpText: "任务组与快捷修改 (⌥G)"
+                                helpText: "快捷对话与任务 (⌥G)"
                             ) {
                                 vm.openWorkspacePanel()
                             }
@@ -1155,7 +1217,7 @@ struct PetContentView: View {
                                 systemName: vm.voice.isRecording ? "stop.circle.fill" : "waveform",
                                 isActive: vm.activePanel == .voice || vm.voice.isRecording,
                                 tint: vm.voice.isRecording ? Color(red: 1.0, green: 0.34, blue: 0.42) : Color(red: 0.42, green: 0.76, blue: 1.0),
-                                helpText: vm.voice.isRecording ? "停止并发送语音" : "语音对话模式"
+                                helpText: vm.voice.isRecording ? "停止并发送语音" : "语音对话"
                             ) {
                                 if vm.voice.isRecording {
                                     vm.toggleVoiceRecording()
@@ -1172,16 +1234,6 @@ struct PetContentView: View {
                             ) {
                                 vm.captureScreenContext()
                             }
-
-                            HoverIconButton(
-                                systemName: "plus",
-                                isActive: false,
-                                tint: Color(red: 0.65, green: 0.62, blue: 1.0),
-                                helpText: "新建并行任务"
-                            ) {
-                                vm.createNewPetTask()
-                                vm.activePanel = .workspace
-                            }
                         }
                         .padding(.horizontal, 7)
                         .padding(.vertical, 4)
@@ -1192,7 +1244,7 @@ struct PetContentView: View {
                                     Capsule()
                                         .strokeBorder(Color(red: 0.62, green: 0.58, blue: 1.0).opacity(0.42), lineWidth: 0.9)
                                 )
-                                .shadow(color: .black.opacity(0.28), radius: 6, y: 2)
+                                .shadow(color: .black.opacity(0.26), radius: 6, y: 2)
                         )
                         .transition(.opacity.combined(with: .scale(scale: 0.94)))
                     }
@@ -1285,7 +1337,7 @@ struct HoverIconButton: View {
     }
 }
 
-// MARK: - Unified Task Group & Inline Modify Floating Panel
+// MARK: - Clean Minimalist Floating Chat & Task Panel (ChatGPT Pet Style)
 
 struct FloatingPanelView: View {
     @ObservedObject var vm: PetViewModel
@@ -1295,32 +1347,22 @@ struct FloatingPanelView: View {
         VStack(spacing: 0) {
             switch vm.activePanel {
             case .workspace:
-                workspaceTaskPanel
+                compactChatTaskPanel
             case .voice:
                 voicePanel
             case .none:
                 EmptyView()
             }
         }
-        .frame(width: 368)
+        .frame(width: 320)
         .background(
-            RoundedRectangle(cornerRadius: 16, style: .continuous)
+            RoundedRectangle(cornerRadius: 15, style: .continuous)
                 .fill(Color(red: 0.09, green: 0.09, blue: 0.16).opacity(0.95))
                 .overlay(
-                    RoundedRectangle(cornerRadius: 16, style: .continuous)
-                        .strokeBorder(
-                            LinearGradient(
-                                colors: [
-                                    Color(red: 0.56, green: 0.66, blue: 1.0).opacity(0.55),
-                                    Color(red: 0.80, green: 0.52, blue: 0.98).opacity(0.45)
-                                ],
-                                startPoint: .topLeading,
-                                endPoint: .bottomTrailing
-                            ),
-                            lineWidth: 1
-                        )
+                    RoundedRectangle(cornerRadius: 15, style: .continuous)
+                        .strokeBorder(Color(red: 0.58, green: 0.62, blue: 1.0).opacity(0.42), lineWidth: 0.9)
                 )
-                .shadow(color: .black.opacity(0.38), radius: 16, y: 6)
+                .shadow(color: .black.opacity(0.36), radius: 14, y: 5)
         )
         .padding(8)
         .onChange(of: vm.focusInputTrigger) {
@@ -1337,184 +1379,110 @@ struct FloatingPanelView: View {
         }
     }
 
-    // 1. Unified Workspace + Task Group + Inline Modify Panel
-    private var workspaceTaskPanel: some View {
-        VStack(spacing: 0) {
-            // Top Bar: Title + Workspace Open + New Task + Close
+    // Ultra-clean 3-part card: 1-line Task Switcher Header + Messages + 1-line Input
+    private var compactChatTaskPanel: some View {
+        let task = vm.selectedTask
+
+        return VStack(spacing: 0) {
+            // 1. Clean Single-Row Header with Dropdown Task Group Switcher
             HStack(spacing: 6) {
-                Text("✦ 工作区与任务组")
-                    .font(.system(size: 12, weight: .semibold, design: .rounded))
-                    .foregroundColor(.white.opacity(0.95))
-
-                if vm.runningTasksCount > 0 {
-                    Text("运行中 \(vm.runningTasksCount)")
-                        .font(.system(size: 10, weight: .semibold))
-                        .foregroundColor(Color(red: 0.52, green: 0.84, blue: 1.0))
-                        .padding(.horizontal, 6)
-                        .padding(.vertical, 2)
-                        .background(Capsule().fill(Color(red: 0.30, green: 0.52, blue: 0.95).opacity(0.28)))
-                }
-
-                Spacer()
-
-                Button {
-                    vm.createNewPetTask()
+                Menu {
+                    ForEach(vm.tasks) { t in
+                        Button {
+                            vm.selectTask(t.id)
+                        } label: {
+                            let mark = (t.state == .running) ? "● " : (t.unread ? "★ " : "")
+                            Text("\(mark)\(t.workspace) · \(t.title)")
+                        }
+                    }
+                    Divider()
+                    Button("+ 新建对话") {
+                        vm.createNewPetTask()
+                    }
                 } label: {
-                    Label("新任务", systemImage: "plus")
-                        .font(.system(size: 10.5, weight: .medium))
-                        .foregroundColor(.white.opacity(0.86))
-                        .padding(.horizontal, 7)
-                        .padding(.vertical, 3)
-                        .background(Capsule().fill(Color.white.opacity(0.11)))
+                    HStack(spacing: 5) {
+                        Circle()
+                            .fill(statusColor(task?.state ?? .idle))
+                            .frame(width: 6.5, height: 6.5)
+                        Text(task.map { "\($0.workspace) · \($0.title)" } ?? "哈基米")
+                            .font(.system(size: 11.5, weight: .semibold, design: .rounded))
+                            .foregroundColor(.white.opacity(0.94))
+                            .lineLimit(1)
+                        Image(systemName: "chevron.down")
+                            .font(.system(size: 8.5, weight: .bold))
+                            .foregroundColor(.white.opacity(0.5))
+                    }
+                    .padding(.horizontal, 7)
+                    .padding(.vertical, 3.5)
+                    .background(Capsule().fill(Color.white.opacity(0.08)))
                 }
-                .buttonStyle(.plain)
+                .menuStyle(.borderlessButton)
+                .fixedSize(horizontal: false, vertical: true)
+
+                Spacer(minLength: 4)
+
+                if task?.isAntigravity == true {
+                    Button {
+                        vm.openApp(named: "/Applications/Antigravity.app")
+                    } label: {
+                        Image(systemName: "arrow.up.right.square")
+                            .font(.system(size: 11.5))
+                            .foregroundColor(.white.opacity(0.62))
+                            .frame(width: 20, height: 20)
+                    }
+                    .buttonStyle(.plain)
+                    .help("在 Antigravity 中打开")
+                }
 
                 Button {
                     vm.closePanel()
                 } label: {
                     Image(systemName: "xmark")
-                        .font(.system(size: 10.5, weight: .bold))
-                        .foregroundColor(.white.opacity(0.65))
-                        .frame(width: 22, height: 22)
+                        .font(.system(size: 10, weight: .bold))
+                        .foregroundColor(.white.opacity(0.6))
+                        .frame(width: 20, height: 20)
                 }
                 .buttonStyle(.plain)
                 .help("关闭 (Esc)")
             }
-            .padding(.horizontal, 12)
-            .padding(.top, 10)
-            .padding(.bottom, 7)
+            .padding(.horizontal, 10)
+            .padding(.vertical, 8)
 
-            // Horizontal Task Group Tabs (switch between Antigravity tasks & Pet threads!)
-            ScrollView(.horizontal, showsIndicators: false) {
-                HStack(spacing: 6) {
-                    ForEach(vm.tasks) { task in
-                        let isSel = (task.id == vm.selectedTask?.id)
-                        Button {
-                            vm.selectTask(task.id)
-                        } label: {
-                            HStack(spacing: 5) {
-                                Circle()
-                                    .fill(statusColor(task.state))
-                                    .frame(width: 6, height: 6)
-                                VStack(alignment: .leading, spacing: 0.5) {
-                                    Text(task.title)
-                                        .font(.system(size: 10.5, weight: isSel ? .semibold : .medium, design: .rounded))
-                                        .foregroundColor(.white.opacity(isSel ? 0.96 : 0.72))
-                                        .lineLimit(1)
-                                    Text(task.workspace)
-                                        .font(.system(size: 9))
-                                        .foregroundColor(.white.opacity(0.45))
-                                        .lineLimit(1)
-                                }
-                                .frame(maxWidth: 112, alignment: .leading)
-                                if task.unread {
-                                    Circle()
-                                        .fill(Color(red: 1.0, green: 0.76, blue: 0.30))
-                                        .frame(width: 5.5, height: 5.5)
-                                }
-                            }
-                            .padding(.horizontal, 8)
-                            .padding(.vertical, 5)
-                            .background(
-                                RoundedRectangle(cornerRadius: 9, style: .continuous)
-                                    .fill(isSel ? Color(red: 0.44, green: 0.42, blue: 0.90).opacity(0.45) : Color.white.opacity(0.06))
-                                    .overlay(
-                                        RoundedRectangle(cornerRadius: 9, style: .continuous)
-                                            .strokeBorder(isSel ? Color(red: 0.62, green: 0.64, blue: 1.0).opacity(0.7) : Color.clear, lineWidth: 0.9)
-                                    )
-                            )
-                        }
-                        .buttonStyle(.plain)
-                    }
-                }
-                .padding(.horizontal, 12)
-                .padding(.bottom, 8)
-            }
-
-            Divider().background(Color.white.opacity(0.10))
-
-            // Selected Task Body (Live Status / Steps / Transcript + Inline Conversation Messages)
-            if let task = vm.selectedTask {
-                // Subheader showing workspace + active status + quick jump to Antigravity
-                HStack(spacing: 6) {
-                    Image(systemName: task.isAntigravity ? "folder.fill" : "sparkles")
-                        .font(.system(size: 10))
-                        .foregroundColor(Color(red: 0.64, green: 0.76, blue: 1.0))
-                    Text("\(task.workspace) · \(task.currentAction)")
-                        .font(.system(size: 11, weight: .medium))
-                        .foregroundColor(.white.opacity(0.80))
-                        .lineLimit(1)
-                    Spacer()
-                    if task.state == .running {
-                        Text(vm.elapsedString(since: task.startedAt))
-                            .font(.system(size: 10.5, design: .monospaced))
-                            .foregroundColor(Color(red: 0.52, green: 0.84, blue: 1.0))
-                    }
-                    if task.isAntigravity {
-                        Button {
-                            vm.openApp(named: "/Applications/Antigravity.app")
-                        } label: {
-                            Text("打开主窗口 ↗")
-                                .font(.system(size: 10))
-                                .foregroundColor(Color(red: 0.72, green: 0.78, blue: 1.0))
-                        }
-                        .buttonStyle(.plain)
-                    }
-                }
-                .padding(.horizontal, 12)
-                .padding(.vertical, 6)
-                .background(Color.white.opacity(0.04))
+            // 2. Clean Conversation / Live Status Body (only shown when there is content or running)
+            if let task, (task.state == .running || !task.agyLastReply.isEmpty || !task.messages.isEmpty) {
+                Divider().background(Color.white.opacity(0.09))
 
                 ScrollViewReader { proxy in
                     ScrollView {
                         VStack(alignment: .leading, spacing: 8) {
-                            // Live Antigravity Step Timeline (if any)
-                            if task.isAntigravity && !task.steps.isEmpty {
-                                VStack(alignment: .leading, spacing: 3) {
-                                    ForEach(task.steps.suffix(5)) { st in
-                                        Text(st.text)
-                                            .font(.system(size: 10.5, design: .monospaced))
-                                            .foregroundColor(.white.opacity(0.65))
-                                            .lineLimit(1)
-                                    }
-                                }
-                                .padding(8)
-                                .frame(maxWidth: .infinity, alignment: .leading)
-                                .background(RoundedRectangle(cornerRadius: 8).fill(Color.white.opacity(0.05)))
-                            }
-
-                            // Latest Antigravity Reply Preview (read-only from transcript)
+                            // Latest Antigravity reply (if this is an Antigravity task)
                             if task.isAntigravity && !task.agyLastReply.isEmpty {
-                                VStack(alignment: .leading, spacing: 4) {
-                                    Text("Antigravity 最新回复")
-                                        .font(.system(size: 10, weight: .semibold))
-                                        .foregroundColor(Color(red: 0.65, green: 0.76, blue: 1.0))
-                                    Text(task.agyLastReply)
-                                        .font(.system(size: 11.5, design: .rounded))
-                                        .foregroundColor(.white.opacity(0.90))
-                                        .textSelection(.enabled)
-                                }
-                                .padding(9)
-                                .frame(maxWidth: .infinity, alignment: .leading)
-                                .background(RoundedRectangle(cornerRadius: 10).fill(Color.white.opacity(0.08)))
+                                Text(task.agyLastReply)
+                                    .font(.system(size: 11.5, design: .rounded))
+                                    .foregroundColor(.white.opacity(0.90))
+                                    .textSelection(.enabled)
+                                    .padding(.horizontal, 10)
+                                    .padding(.vertical, 7)
+                                    .frame(maxWidth: .infinity, alignment: .leading)
+                                    .background(RoundedRectangle(cornerRadius: 10).fill(Color.white.opacity(0.08)))
                             }
 
-                            // Inline Follow-up / Conversation Messages inside this Task
+                            // Chat Messages
                             ForEach(task.messages) { msg in
                                 HStack {
-                                    if msg.isUser { Spacer(minLength: 36) }
+                                    if msg.isUser { Spacer(minLength: 32) }
                                     VStack(alignment: msg.isUser ? .trailing : .leading, spacing: 3) {
                                         if msg.hasImage {
-                                            Text("📸 已附带屏幕截图")
-                                                .font(.system(size: 10))
-                                                .foregroundColor(Color(red: 0.58, green: 0.88, blue: 0.82))
+                                            Text("📸 屏幕截图")
+                                                .font(.system(size: 9.5))
+                                                .foregroundColor(Color(red: 0.56, green: 0.88, blue: 0.80))
                                         }
                                         Text(msg.text)
                                             .font(.system(size: 12, design: .rounded))
                                             .foregroundColor(.white.opacity(0.94))
                                             .textSelection(.enabled)
                                             .padding(.horizontal, 10)
-                                            .padding(.vertical, 7)
+                                            .padding(.vertical, 6.5)
                                             .background(
                                                 RoundedRectangle(cornerRadius: 11, style: .continuous)
                                                     .fill(msg.isUser
@@ -1526,51 +1494,54 @@ struct FloatingPanelView: View {
                                                 Button {
                                                     NSPasteboard.general.clearContents()
                                                     NSPasteboard.general.setString(msg.text, forType: .string)
-                                                    vm.showToast("已复制 ✦")
+                                                    vm.showToast("已复制")
                                                 } label: {
-                                                    Label("复制", systemImage: "doc.on.doc")
+                                                    Image(systemName: "doc.on.doc")
                                                         .font(.system(size: 10))
-                                                        .foregroundColor(.white.opacity(0.55))
+                                                        .foregroundColor(.white.opacity(0.5))
                                                 }
                                                 .buttonStyle(.plain)
+                                                .help("复制回复")
 
                                                 Button {
                                                     vm.voice.speakSystemTTS(msg.text)
                                                 } label: {
-                                                    Label("朗读", systemImage: "speaker.wave.2")
+                                                    Image(systemName: "speaker.wave.2")
                                                         .font(.system(size: 10))
-                                                        .foregroundColor(.white.opacity(0.55))
+                                                        .foregroundColor(.white.opacity(0.5))
                                                 }
                                                 .buttonStyle(.plain)
+                                                .help("朗读回复")
                                             }
                                             .padding(.leading, 4)
                                         }
                                     }
-                                    if !msg.isUser { Spacer(minLength: 24) }
+                                    if !msg.isUser { Spacer(minLength: 20) }
                                 }
                                 .id(msg.id)
                             }
 
+                            // Clean single-line running indicator
                             if task.state == .running {
                                 HStack(spacing: 6) {
                                     ProgressView()
-                                        .scaleEffect(0.6)
+                                        .scaleEffect(0.58)
                                         .colorScheme(.dark)
-                                    Text(task.currentAction)
+                                    Text(task.currentAction.isEmpty ? "思考中…" : task.currentAction)
                                         .font(.system(size: 11.5))
                                         .foregroundColor(Color(red: 0.65, green: 0.84, blue: 1.0))
+                                        .lineLimit(1)
+                                    Spacer()
+                                    Text(vm.elapsedString(since: task.startedAt))
+                                        .font(.system(size: 10, design: .monospaced))
+                                        .foregroundColor(.white.opacity(0.5))
                                 }
-                                .id("running-indicator")
-                            } else if !task.isAntigravity && task.messages.isEmpty {
-                                Text("直接输入问题或修改指令，回车即可在这个任务对话里继续处理 ✦")
-                                    .font(.system(size: 11.5))
-                                    .foregroundColor(.white.opacity(0.45))
-                                    .padding(.vertical, 8)
+                                .id("running-row")
                             }
                         }
                         .padding(10)
                     }
-                    .frame(maxHeight: 215)
+                    .frame(maxHeight: 195)
                     .onChange(of: task.messages.count) {
                         if let last = task.messages.last {
                             withAnimation { proxy.scrollTo(last.id, anchor: .bottom) }
@@ -1579,76 +1550,54 @@ struct FloatingPanelView: View {
                 }
             }
 
-            // Attached Screen Chip
+            // Attached Screen Chip (only when screen captured)
             if vm.attachedScreenPath != nil {
-                HStack(spacing: 6) {
+                HStack(spacing: 5) {
                     Image(systemName: "photo")
-                        .font(.system(size: 10.5))
+                        .font(.system(size: 10))
                         .foregroundColor(Color(red: 0.42, green: 0.88, blue: 0.78))
-                    Text("已附带当前屏幕截图")
-                        .font(.system(size: 11))
-                        .foregroundColor(.white.opacity(0.86))
+                    Text("已附带当前屏幕")
+                        .font(.system(size: 10.5))
+                        .foregroundColor(.white.opacity(0.85))
                     Spacer()
-                    Button {
-                        vm.clearAttachedScreen()
-                    } label: {
+                    Button { vm.clearAttachedScreen() } label: {
                         Image(systemName: "xmark.circle.fill")
-                            .font(.system(size: 11))
-                            .foregroundColor(.white.opacity(0.55))
+                            .font(.system(size: 10.5))
+                            .foregroundColor(.white.opacity(0.5))
                     }
                     .buttonStyle(.plain)
                 }
                 .padding(.horizontal, 10)
-                .padding(.vertical, 5)
-                .background(Color(red: 0.20, green: 0.35, blue: 0.36).opacity(0.45))
-                .cornerRadius(8)
+                .padding(.vertical, 4)
+                .background(Color(red: 0.20, green: 0.34, blue: 0.36).opacity(0.42))
+                .cornerRadius(7)
                 .padding(.horizontal, 10)
                 .padding(.top, 4)
             }
 
-            Divider().background(Color.white.opacity(0.10)).padding(.top, 4)
+            Divider().background(Color.white.opacity(0.09))
 
-            // Persistent Inline Modify / Follow-up Composer
+            // 3. Clean Single-Row Input Bar
             HStack(spacing: 6) {
                 Button {
                     vm.captureScreenContext()
                 } label: {
                     Image(systemName: "viewfinder")
                         .font(.system(size: 13))
-                        .foregroundColor(vm.attachedScreenPath != nil ? Color(red: 0.38, green: 0.90, blue: 0.78) : .white.opacity(0.68))
-                        .frame(width: 24, height: 24)
+                        .foregroundColor(vm.attachedScreenPath != nil ? Color(red: 0.38, green: 0.90, blue: 0.78) : .white.opacity(0.65))
+                        .frame(width: 22, height: 22)
                 }
                 .buttonStyle(.plain)
-                .help("截取当前屏幕一起问")
+                .help("附带当前屏幕")
 
-                TextField(
-                    vm.selectedTask?.isAntigravity == true
-                        ? "在此任务里追加修改或追问… (回车)"
-                        : "输入问题或修改要求… (回车发送)",
-                    text: $vm.inputText
-                )
-                .textFieldStyle(.plain)
-                .font(.system(size: 12.5, design: .rounded))
-                .foregroundColor(.white)
-                .focused($isInputFocused)
-                .onSubmit {
-                    vm.sendTextPrompt()
-                }
-
-                if vm.selectedTask?.isAntigravity == true && !vm.inputText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                    Button {
-                        vm.sendModifyToAntigravity()
-                    } label: {
-                        Text("去AGY")
-                            .font(.system(size: 10, weight: .semibold))
-                            .foregroundColor(.white.opacity(0.9))
-                            .padding(.horizontal, 6)
-                            .padding(.vertical, 3)
-                            .background(Capsule().fill(Color(red: 0.38, green: 0.56, blue: 0.95).opacity(0.8)))
+                TextField("问哈基米或直接修改…", text: $vm.inputText)
+                    .textFieldStyle(.plain)
+                    .font(.system(size: 12.5, design: .rounded))
+                    .foregroundColor(.white)
+                    .focused($isInputFocused)
+                    .onSubmit {
+                        vm.sendTextPrompt()
                     }
-                    .buttonStyle(.plain)
-                    .help("复制此修改指令并立即跳到 Antigravity 粘贴发送")
-                }
 
                 Button {
                     vm.openVoicePanelAndRecord()
@@ -1656,41 +1605,41 @@ struct FloatingPanelView: View {
                     Image(systemName: "waveform")
                         .font(.system(size: 13))
                         .foregroundColor(Color(red: 0.52, green: 0.80, blue: 1.0))
-                        .frame(width: 24, height: 24)
+                        .frame(width: 22, height: 22)
                 }
                 .buttonStyle(.plain)
-                .help("切到语音模式")
+                .help("语音对话")
 
                 Button {
                     vm.sendTextPrompt()
                 } label: {
                     Image(systemName: "arrow.up.circle.fill")
-                        .font(.system(size: 19))
+                        .font(.system(size: 18))
                         .foregroundColor(
                             (!vm.inputText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || vm.attachedScreenPath != nil)
                                 ? Color(red: 0.56, green: 0.54, blue: 1.0)
-                                : Color.white.opacity(0.25)
+                                : Color.white.opacity(0.24)
                         )
                 }
                 .buttonStyle(.plain)
             }
             .padding(.horizontal, 10)
-            .padding(.vertical, 9)
+            .padding(.vertical, 8)
         }
     }
 
-    // 2. Voice Mode Panel
+    // Voice Mode Panel
     private var voicePanel: some View {
         VStack(spacing: 12) {
             HStack {
-                Text("🎙 哈基米语音模式")
+                Text("🎙 语音模式")
                     .font(.system(size: 12, weight: .semibold, design: .rounded))
                     .foregroundColor(.white.opacity(0.95))
                 Spacer()
                 Button {
                     vm.activePanel = .workspace
                 } label: {
-                    Text("返回任务组")
+                    Text("切文字")
                         .font(.system(size: 10.5))
                         .foregroundColor(.white.opacity(0.72))
                         .padding(.horizontal, 7)
@@ -1704,9 +1653,9 @@ struct FloatingPanelView: View {
                     vm.closePanel()
                 } label: {
                     Image(systemName: "xmark")
-                        .font(.system(size: 10.5, weight: .bold))
-                        .foregroundColor(.white.opacity(0.65))
-                        .frame(width: 22, height: 22)
+                        .font(.system(size: 10, weight: .bold))
+                        .foregroundColor(.white.opacity(0.6))
+                        .frame(width: 20, height: 20)
                 }
                 .buttonStyle(.plain)
             }
@@ -1720,48 +1669,43 @@ struct FloatingPanelView: View {
                             RadialGradient(
                                 colors: vm.voice.isRecording
                                     ? [Color(red: 1.0, green: 0.35, blue: 0.45), Color(red: 0.65, green: 0.16, blue: 0.34)]
-                                    : (vm.isAnyTaskThinking
-                                       ? [Color(red: 0.48, green: 0.58, blue: 1.0), Color(red: 0.30, green: 0.24, blue: 0.72)]
-                                       : [Color(red: 0.46, green: 0.72, blue: 1.0), Color(red: 0.48, green: 0.34, blue: 0.88)]),
+                                    : [Color(red: 0.46, green: 0.72, blue: 1.0), Color(red: 0.48, green: 0.34, blue: 0.88)],
                                 center: .center,
                                 startRadius: 6,
-                                endRadius: 36
+                                endRadius: 34
                             )
                         )
-                        .frame(width: 66, height: 66)
-                        .shadow(color: (vm.voice.isRecording ? Color.red : Color.purple).opacity(0.45), radius: 10)
+                        .frame(width: 62, height: 62)
+                        .shadow(color: (vm.voice.isRecording ? Color.red : Color.purple).opacity(0.42), radius: 9)
 
                     if vm.selectedTask?.state == .running {
                         ProgressView().colorScheme(.dark)
                     } else {
                         Image(systemName: vm.voice.isRecording ? "stop.fill" : "mic.fill")
-                            .font(.system(size: 22, weight: .semibold))
+                            .font(.system(size: 20, weight: .semibold))
                             .foregroundColor(.white)
                     }
                 }
             }
             .buttonStyle(.plain)
 
-            VStack(spacing: 4) {
-                Text(vm.voice.isRecording ? "正在聆听 \(String(format: "%d:%02d", vm.voice.recordingSeconds / 60, vm.voice.recordingSeconds % 60))" : vm.voiceStatusHint)
-                    .font(.system(size: 12, weight: .medium, design: .rounded))
-                    .foregroundColor(.white.opacity(0.92))
+            Text(vm.voice.isRecording ? "聆听中 \(String(format: "%d:%02d", vm.voice.recordingSeconds / 60, vm.voice.recordingSeconds % 60))" : vm.voiceStatusHint)
+                .font(.system(size: 12, weight: .medium, design: .rounded))
+                .foregroundColor(.white.opacity(0.90))
 
-                if let lastReply = vm.selectedTask?.messages.last(where: { !$0.isUser }) {
-                    Text(lastReply.text)
-                        .font(.system(size: 11.5))
-                        .foregroundColor(.white.opacity(0.74))
-                        .lineLimit(3)
-                        .multilineTextAlignment(.center)
-                        .padding(.top, 2)
-                }
+            if let lastReply = vm.selectedTask?.messages.last(where: { !$0.isUser }) {
+                Text(lastReply.text)
+                    .font(.system(size: 11.5))
+                    .foregroundColor(.white.opacity(0.72))
+                    .lineLimit(3)
+                    .multilineTextAlignment(.center)
             }
 
             HStack(spacing: 8) {
                 Button {
                     vm.captureScreenContext()
                 } label: {
-                    Label(vm.attachedScreenPath != nil ? "已附带屏幕" : "同时看屏幕", systemImage: "viewfinder")
+                    Label(vm.attachedScreenPath != nil ? "已附带屏幕" : "看屏幕", systemImage: "viewfinder")
                         .font(.system(size: 11))
                         .foregroundColor(vm.attachedScreenPath != nil ? Color(red: 0.42, green: 0.92, blue: 0.80) : .white.opacity(0.8))
                         .padding(.horizontal, 10)
@@ -1798,15 +1742,16 @@ struct FloatingPanelView: View {
     }
 }
 
-// MARK: - Compact Native Settings Window View
+// MARK: - Full-Featured Clean Native Settings Window
 
 struct PetSettingsView: View {
     @ObservedObject var vm: PetViewModel
     let onOpenStickers: () -> Void
+    let onOpenAntigravity: () -> Void
     let onQuit: () -> Void
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 14) {
+        VStack(alignment: .leading, spacing: 13) {
             HStack(spacing: 8) {
                 Text("✦ 哈基米桌宠设置")
                     .font(.system(size: 14, weight: .semibold, design: .rounded))
@@ -1821,41 +1766,70 @@ struct PetSettingsView: View {
 
             Divider()
 
-            VStack(alignment: .leading, spacing: 6) {
+            // Size
+            VStack(alignment: .leading, spacing: 5) {
                 Text("尺寸大小")
-                    .font(.system(size: 12, weight: .medium))
+                    .font(.system(size: 11.5, weight: .medium))
                     .foregroundColor(.secondary)
                 Picker("", selection: $vm.petSize) {
-                    Text("80px").tag(PetSizePreset.xs)
-                    Text("96px").tag(PetSizePreset.sm)
-                    Text("112px").tag(PetSizePreset.gptDefault)
-                    Text("136px").tag(PetSizePreset.md)
-                    Text("164px").tag(PetSizePreset.lg)
+                    ForEach(PetSizePreset.allCases, id: \.self) { p in
+                        Text(p.title).tag(p)
+                    }
                 }
                 .pickerStyle(.segmented)
                 .labelsHidden()
             }
 
-            VStack(alignment: .leading, spacing: 6) {
+            // Motion Style
+            VStack(alignment: .leading, spacing: 5) {
                 Text("动效风格")
-                    .font(.system(size: 12, weight: .medium))
+                    .font(.system(size: 11.5, weight: .medium))
                     .foregroundColor(.secondary)
                 Picker("", selection: $vm.motionStyle) {
-                    Text("克制微动").tag(MotionStyle.calm)
-                    Text("完全静态").tag(MotionStyle.still)
-                    Text("活泼动画").tag(MotionStyle.lively)
+                    ForEach(MotionStyle.allCases, id: \.self) { st in
+                        Text(st.title).tag(st)
+                    }
                 }
                 .pickerStyle(.segmented)
                 .labelsHidden()
             }
 
-            VStack(alignment: .leading, spacing: 6) {
-                Text("对话模型")
-                    .font(.system(size: 12, weight: .medium))
+            // Manual Mood Switcher
+            VStack(alignment: .leading, spacing: 5) {
+                Text("切换表情 / 状态")
+                    .font(.system(size: 11.5, weight: .medium))
+                    .foregroundColor(.secondary)
+                HStack(spacing: 6) {
+                    ForEach([PetMood.idle, .happy, .working, .hiss, .sleep], id: \.self) { m in
+                        Button {
+                            vm.selectManualMood(m)
+                        } label: {
+                            HStack(spacing: 3) {
+                                Text(m.icon)
+                                Text(m.displayName)
+                            }
+                            .font(.system(size: 11.5))
+                            .frame(maxWidth: .infinity)
+                            .padding(.vertical, 4)
+                            .background(
+                                RoundedRectangle(cornerRadius: 6)
+                                    .fill(vm.mood == m ? Color.accentColor.opacity(0.22) : Color.secondary.opacity(0.10))
+                            )
+                        }
+                        .buttonStyle(.plain)
+                    }
+                }
+            }
+
+            // AI Model
+            VStack(alignment: .leading, spacing: 5) {
+                Text("快捷对话模型")
+                    .font(.system(size: 11.5, weight: .medium))
                     .foregroundColor(.secondary)
                 Picker("", selection: $vm.modelPreset) {
-                    Text("极速 (Flash Lite)").tag(AIModelPreset.fast)
-                    Text("深度 (Gemini 4)").tag(AIModelPreset.smart)
+                    ForEach(AIModelPreset.allCases, id: \.self) { m in
+                        Text(m.title).tag(m)
+                    }
                 }
                 .pickerStyle(.segmented)
                 .labelsHidden()
@@ -1863,25 +1837,28 @@ struct PetSettingsView: View {
 
             Divider()
 
-            VStack(alignment: .leading, spacing: 8) {
-                Toggle("常态显示顶部工作区与任务栏", isOn: $vm.alwaysShowTaskBar)
-                Toggle("Mini 模式（隐藏角色，仅保留任务条）", isOn: $vm.miniMode)
-                Toggle("窗口悬浮置顶（显示桌面时也保留）", isOn: $vm.alwaysOnTop)
+            // Behavior Toggles
+            VStack(alignment: .leading, spacing: 7) {
+                Toggle("任务进行时显示头顶状态条（完成后可关闭/自动消失）", isOn: $vm.showTaskBanner)
+                Toggle("Mini 模式（隐藏角色，仅保留快捷条）", isOn: $vm.miniMode)
+                Toggle("窗口悬浮置顶（点按桌面时也留在前台）", isOn: $vm.alwaysOnTop)
                 Toggle("Antigravity 实时任务联动", isOn: $vm.agySyncEnabled)
                 Toggle("桌面自由散步", isOn: $vm.wanderEnabled)
+                Toggle("开机自动启动", isOn: $vm.launchAtLogin)
             }
-            .font(.system(size: 12.5))
+            .font(.system(size: 12))
 
             Divider()
 
-            HStack {
-                Button("打开表情包文件夹", action: onOpenStickers)
+            HStack(spacing: 8) {
+                Button("表情包文件夹", action: onOpenStickers)
+                Button("打开 Antigravity", action: onOpenAntigravity)
                 Spacer()
-                Button("退出桌宠", role: .destructive, action: onQuit)
+                Button("退出", role: .destructive, action: onQuit)
             }
         }
         .padding(18)
-        .frame(width: 350)
+        .frame(width: 380)
     }
 }
 
@@ -2033,10 +2010,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func petWindowSize() -> NSSize {
         if vm.miniMode {
-            return NSSize(width: 212, height: 92)
+            return NSSize(width: 216, height: 72)
         }
         let s = vm.petSize.rawValue
-        return NSSize(width: max(212, s + 24), height: s + 88)
+        return NSSize(width: max(216, s + 24), height: s + 72)
     }
 
     private func setupPetWindow() {
@@ -2074,7 +2051,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func setupPanelWindow() {
         panelWindow = FloatingInputPanel(
-            contentRect: NSRect(x: 0, y: 0, width: 384, height: 360),
+            contentRect: NSRect(x: 0, y: 0, width: 336, height: 140),
             styleMask: [.borderless, .nonactivatingPanel],
             backing: .buffered,
             defer: false
@@ -2101,8 +2078,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guard let hosting = panelWindow.contentView else { return }
         hosting.layoutSubtreeIfNeeded()
         let fitting = hosting.fittingSize
-        let w = max(384, fitting.width)
-        let h = max(160, min(440, fitting.height))
+        let w = max(336, fitting.width)
+        let h = max(108, min(360, fitting.height))
 
         let petFrame = petWindow.frame
         let screen = petWindow.screen?.visibleFrame ?? NSScreen.main?.visibleFrame ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
@@ -2110,9 +2087,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         var px = petFrame.midX - w / 2
         px = max(screen.minX + 12, min(screen.maxX - w - 12, px))
 
-        var py = petFrame.maxY + 4
+        var py = petFrame.maxY + 2
         if py + h > screen.maxY - 12 {
-            py = max(screen.minY + 12, petFrame.minY - h - 4)
+            py = max(screen.minY + 12, petFrame.minY - h - 2)
         }
 
         panelWindow.setFrame(NSRect(x: px, y: py, width: w, height: h), display: true)
@@ -2203,12 +2180,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if let button = statusItem.button {
             button.title = "✦"
             button.font = NSFont.systemFont(ofSize: 15, weight: .semibold)
-            button.toolTip = "Gemini 哈基米桌宠 (⌥G 工作区与任务组)"
+            button.toolTip = "Gemini 哈基米桌宠 (⌥G 快捷对话)"
         }
         statusItem.menu = buildStatusBarMenu()
     }
 
-    /// Ultra-clean 2-item right-click menu on the pet (just like ChatGPT Desktop Pet)
+    /// Minimalist 2-item right-click menu (ChatGPT Pet style)
     private func buildPetContextMenu() -> NSMenu {
         let menu = NSMenu()
 
@@ -2234,7 +2211,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         toggleItem.target = self
         menu.addItem(toggleItem)
 
-        let chatItem = NSMenuItem(title: "工作区与任务组 (⌥G)", action: #selector(openWorkspaceAction), keyEquivalent: "")
+        let chatItem = NSMenuItem(title: "快捷对话与任务 (⌥G)", action: #selector(openWorkspaceAction), keyEquivalent: "")
         chatItem.target = self
         menu.addItem(chatItem)
 
@@ -2272,11 +2249,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let view = PetSettingsView(
             vm: vm,
             onOpenStickers: { [weak self] in self?.openStickersFolder() },
+            onOpenAntigravity: { [weak self] in self?.vm.openApp(named: "/Applications/Antigravity.app") },
             onQuit: { [weak self] in self?.quitApp() }
         )
         let hosting = NSHostingView(rootView: view)
         let win = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 350, height: 420),
+            contentRect: NSRect(x: 0, y: 0, width: 380, height: 500),
             styleMask: [.titled, .closable],
             backing: .buffered,
             defer: false

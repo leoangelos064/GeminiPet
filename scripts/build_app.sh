@@ -36,9 +36,9 @@ cat > "$CONTENTS/Info.plist" << 'EOF'
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleShortVersionString</key>
-    <string>2.0</string>
+    <string>2.3.0</string>
     <key>CFBundleVersion</key>
-    <string>5</string>
+    <string>6</string>
     <key>LSMinimumSystemVersion</key>
     <string>13.0</string>
     <key>LSUIElement</key>
@@ -76,6 +76,7 @@ swiftc -O \
     -framework Combine \
     -framework AVFoundation \
     -framework Carbon \
+    "$BASE_DIR/src/GeminiAppLogMonitor.swift" \
     "$BASE_DIR/src/GeminiPetApp.swift" \
     -o "$MACOS/GeminiPet"
 

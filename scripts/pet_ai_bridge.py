@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """
 Backend AI bridge for GeminiPet (ChatGPT-Desktop-Pet-parity Quick Chat, Screen Context & Voice Mode).
+Compatible with macOS system Python 3.9+ (`/usr/bin/python3`) as well as Python 3.10+.
 Calls the locally authenticated `~/.local/bin/gemini-api` CLI and returns clean JSON on stdout.
 """
+from __future__ import annotations
 
 import argparse
 import json
@@ -11,6 +13,7 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
+from typing import List, Optional, Tuple
 
 GEMINI_API = str(Path.home() / ".local" / "bin" / "gemini-api")
 
@@ -22,8 +25,7 @@ SYSTEM_PROMPT = (
 
 
 def extract_reply_text(resp: dict) -> str:
-    # Handle Interactions API shape (.steps[] / .outputs[])
-    texts = []
+    texts: List[str] = []
     for key in ("outputs", "steps"):
         for item in resp.get(key) or []:
             if not isinstance(item, dict):
@@ -37,22 +39,32 @@ def extract_reply_text(resp: dict) -> str:
                         texts.append(c["text"])
     if texts:
         return "\n".join(texts).strip()
-    # Fallback plain text fields
     for k in ("text", "output", "response"):
         if isinstance(resp.get(k), str) and resp[k].strip():
             return resp[k].strip()
     return ""
 
 
-def run_generate(prompt: str, inputs: list[str], prev_id: str | None, model: str) -> tuple[str, str | None, str | None]:
+def run_generate(
+    prompt: str,
+    inputs: List[str],
+    prev_id: Optional[str],
+    model: str,
+) -> Tuple[str, Optional[str], Optional[str]]:
+    if not Path(GEMINI_API).exists():
+        return "", prev_id, f"未找到 {GEMINI_API}，请确认已安装 gemini-api CLI"
+
     cmd = [
         GEMINI_API,
         "generate",
         prompt,
-        "-m", model,
-        "--system", SYSTEM_PROMPT,
+        "-m",
+        model,
+        "--system",
+        SYSTEM_PROMPT,
         "--stream=false",
-        "-o", "json",
+        "-o",
+        "json",
     ]
     if prev_id:
         cmd += ["--previous-interaction-id", prev_id]
@@ -60,7 +72,13 @@ def run_generate(prompt: str, inputs: list[str], prev_id: str | None, model: str
         if inp and Path(inp).exists():
             cmd += ["-i", inp]
 
-    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=90)
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=90)
+    except subprocess.TimeoutExpired:
+        return "", prev_id, "请求超时，请稍后重试"
+    except Exception as exc:
+        return "", prev_id, f"调用失败：{exc}"
+
     if proc.returncode != 0:
         err = (proc.stderr or proc.stdout or f"exit {proc.returncode}").strip()
         return "", prev_id, err[:300]
@@ -71,17 +89,15 @@ def run_generate(prompt: str, inputs: list[str], prev_id: str | None, model: str
         text = extract_reply_text(data)
         new_id = data.get("id") or prev_id
         if not text:
-            # Fallback: retry plain text output if JSON schema differed
             return raw[:800], new_id, None
         return text, new_id, None
     except Exception:
         return raw[:800], prev_id, None
 
 
-def run_tts(text: str, voice: str = "Kore") -> str | None:
-    if not text:
+def run_tts(text: str, voice: str = "Kore") -> Optional[str]:
+    if not text or not Path(GEMINI_API).exists():
         return None
-    # Keep TTS concise for snappy playback
     spoken = text.replace("*", "").replace("#", "").replace("`", "").strip()
     if len(spoken) > 220:
         spoken = spoken[:220] + "。"
@@ -90,8 +106,10 @@ def run_tts(text: str, voice: str = "Kore") -> str | None:
         GEMINI_API,
         "tts",
         spoken,
-        "-v", voice,
-        "--out", out_wav,
+        "-v",
+        voice,
+        "--out",
+        out_wav,
     ]
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True, timeout=45)
@@ -106,7 +124,7 @@ def run_tts(text: str, voice: str = "Kore") -> str | None:
     return None
 
 
-def main():
+def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--prompt", default="")
     parser.add_argument("--audio", default="")
@@ -117,7 +135,7 @@ def main():
     parser.add_argument("--voice", default="Kore")
     args = parser.parse_args()
 
-    inputs = []
+    inputs: List[str] = []
     if args.image:
         inputs.append(args.image)
     if args.audio:
@@ -144,13 +162,21 @@ def main():
     if args.speak and text:
         audio_path = run_tts(text, voice=args.voice)
 
-    print(json.dumps({
-        "ok": True,
-        "text": text,
-        "interaction_id": new_id or "",
-        "audio_path": audio_path or "",
-    }, ensure_ascii=False))
+    print(
+        json.dumps(
+            {
+                "ok": True,
+                "text": text,
+                "interaction_id": new_id or "",
+                "audio_path": audio_path or "",
+            },
+            ensure_ascii=False,
+        )
+    )
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as exc:
+        print(json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False))

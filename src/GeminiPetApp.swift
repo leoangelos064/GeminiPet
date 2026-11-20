@@ -914,16 +914,20 @@ final class PetViewModel: ObservableObject {
                 if speak { args += ["--speak"] }
                 proc.arguments = args
 
-                let pipe = Pipe()
-                proc.standardOutput = pipe
-                proc.standardError = pipe
+                let outPipe = Pipe()
+                let errPipe = Pipe()
+                proc.standardOutput = outPipe
+                proc.standardError = errPipe
 
                 var outputStr = ""
+                var errStr = ""
                 do {
                     try proc.run()
-                    let data = pipe.fileHandleForReading.readDataToEndOfFile()
+                    let outData = outPipe.fileHandleForReading.readDataToEndOfFile()
+                    let errData = errPipe.fileHandleForReading.readDataToEndOfFile()
                     proc.waitUntilExit()
-                    outputStr = String(data: data, encoding: .utf8) ?? ""
+                    outputStr = String(data: outData, encoding: .utf8) ?? ""
+                    errStr = String(data: errData, encoding: .utf8) ?? ""
                 } catch {
                     outputStr = "{\"ok\":false,\"error\":\"\(error.localizedDescription)\"}"
                 }
@@ -936,7 +940,8 @@ final class PetViewModel: ObservableObject {
                    let r = try? JSONDecoder().decode(BridgeResponse.self, from: d) {
                     return r
                 } else {
-                    return BridgeResponse(ok: false, text: nil, interaction_id: nil, audio_path: nil, error: outputStr.isEmpty ? "请求失败" : String(outputStr.prefix(160)))
+                    let msg = !outputStr.isEmpty ? outputStr : (!errStr.isEmpty ? errStr : "请求失败")
+                    return BridgeResponse(ok: false, text: nil, interaction_id: nil, audio_path: nil, error: String(msg.prefix(160)))
                 }
             }.value
 

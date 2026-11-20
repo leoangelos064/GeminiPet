@@ -353,7 +353,17 @@ final class PetViewModel: ObservableObject {
             onSizeChanged?()
         }
     }
-    @Published var motionStyle: MotionStyle = .calm
+    @Published var motionStyle: MotionStyle = {
+        if let raw = UserDefaults.standard.string(forKey: "motionStyle"),
+           let saved = MotionStyle(rawValue: raw) {
+            return saved
+        }
+        return .lively
+    }() {
+        didSet {
+            UserDefaults.standard.set(motionStyle.rawValue, forKey: "motionStyle")
+        }
+    }
     @Published var modelPreset: AIModelPreset = .fast
     @Published var alwaysOnTop: Bool = true {
         didSet { onAlwaysOnTopChanged?(alwaysOnTop) }

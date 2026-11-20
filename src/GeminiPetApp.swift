@@ -1758,8 +1758,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         petWindow.isOpaque = false
         petWindow.backgroundColor = .clear
         petWindow.hasShadow = false
-        petWindow.level = .floating
-        petWindow.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+        petWindow.hidesOnDeactivate = false
+        petWindow.canHide = false
+        petWindow.level = .statusBar
+        petWindow.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary, .ignoresCycle]
         petWindow.isMovableByWindowBackground = false
 
         let contentView = PetContentView(vm: vm) { [weak self] event in
@@ -1782,8 +1784,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         panelWindow.isOpaque = false
         panelWindow.backgroundColor = .clear
         panelWindow.hasShadow = false
-        panelWindow.level = .floating
-        panelWindow.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+        panelWindow.canHide = false
+        panelWindow.level = .statusBar
+        panelWindow.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary, .ignoresCycle]
         panelWindow.hidesOnDeactivate = false
         panelWindow.onEscape = { [weak self] in
             self?.vm.closePanel()
@@ -1834,7 +1837,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         vm.onAlwaysOnTopChanged = { [weak self] onTop in
-            let lvl: NSWindow.Level = onTop ? .floating : .normal
+            let lvl: NSWindow.Level = onTop ? .statusBar : .normal
             self?.petWindow.level = lvl
             self?.panelWindow.level = lvl
         }
@@ -2014,6 +2017,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc private func openStickersFolder() {
+        if let resStickers = Bundle.main.resourceURL?.appendingPathComponent("stickers"),
+           FileManager.default.fileExists(atPath: resStickers.path) {
+            NSWorkspace.shared.open(resStickers)
+            return
+        }
         let appDir = Bundle.main.bundleURL.deletingLastPathComponent()
         let stickersDir = appDir.appendingPathComponent("stickers")
         if FileManager.default.fileExists(atPath: stickersDir.path) {

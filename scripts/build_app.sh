@@ -7,12 +7,14 @@ CONTENTS="$APP_DIR/Contents"
 MACOS="$CONTENTS/MacOS"
 RESOURCES="$CONTENTS/Resources"
 
-rm -rf "$RESOURCES/sprites"
-mkdir -p "$MACOS" "$RESOURCES/sprites"
+rm -rf "$RESOURCES/sprites" "$RESOURCES/stickers"
+mkdir -p "$MACOS" "$RESOURCES/sprites" "$RESOURCES/stickers"
 
 cp -f "$BASE_DIR/sprites/"*.png "$RESOURCES/sprites/"
+cp -f "$BASE_DIR/stickers/"*.png "$RESOURCES/stickers/"
 cp -f "$BASE_DIR/scripts/pet_ai_bridge.py" "$RESOURCES/pet_ai_bridge.py"
-chmod +x "$RESOURCES/pet_ai_bridge.py"
+cp -f "$BASE_DIR/scripts/agy_pet_hook.py" "$RESOURCES/agy_pet_hook.py"
+chmod +x "$RESOURCES/pet_ai_bridge.py" "$RESOURCES/agy_pet_hook.py"
 
 cat > "$CONTENTS/Info.plist" << 'EOF'
 <?xml version="1.0" encoding="UTF-8"?>

@@ -344,8 +344,14 @@ final class PetViewModel: ObservableObject {
     }
     @Published var isFacingLeft: Bool = false
     @Published var dragTiltDegrees: Double = 0
-    @Published var petSize: PetSizePreset = .gptDefault {
-        didSet { onSizeChanged?() }
+    @Published var petSize: PetSizePreset = {
+        let saved = UserDefaults.standard.double(forKey: "petSize")
+        return PetSizePreset(rawValue: CGFloat(saved)) ?? .md
+    }() {
+        didSet {
+            UserDefaults.standard.set(Double(petSize.rawValue), forKey: "petSize")
+            onSizeChanged?()
+        }
     }
     @Published var motionStyle: MotionStyle = .calm
     @Published var modelPreset: AIModelPreset = .fast

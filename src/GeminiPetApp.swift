@@ -112,10 +112,8 @@ enum TaskSource: String, CaseIterable {
         switch self {
         case .antigravity: return "Antigravity"
         case .antigravityIDE: return "AGY IDE"
-        case .geminiAgent: return "Gemini·Agent"
-        case .geminiVideo: return "Gemini·视频"
-        case .geminiChat: return "Gemini·对话"
-        case .petQuickChat: return "API 快捷"
+        case .geminiAgent, .geminiVideo, .geminiChat: return "Gemini"
+        case .petQuickChat: return "API"
         }
     }
 
@@ -1529,6 +1527,8 @@ struct PetContentView: View {
                                         .lineLimit(1)
                                         .truncationMode(.tail)
 
+                                    Spacer(minLength: 4)
+
                                     if bt.state == .running {
                                         Text(vm.elapsedString(since: bt.startedAt))
                                             .font(.system(size: 9.5, design: .monospaced))
@@ -1566,7 +1566,7 @@ struct PetContentView: View {
                         .padding(.leading, 8)
                         .padding(.trailing, 6)
                         .padding(.vertical, 5)
-                        .frame(maxWidth: 304)
+                        .frame(minWidth: 236, maxWidth: 304)
                         .background(
                             Capsule()
                                 .fill(Color(red: 0.10, green: 0.09, blue: 0.18).opacity(0.92))
@@ -1723,17 +1723,37 @@ struct PetContentView: View {
     }
 
     private func bannerBodyText(for task: PetTaskThread) -> String {
-        let ws = task.workspace.trimmingCharacters(in: .whitespacesAndNewlines)
-        let showWS = !ws.isEmpty && ws != "Gemini" && ws != "API" && ws != "默认工作区"
-        let prefix = showWS ? "\(ws) · " : ""
+        let contextLabel: String
+        switch task.source {
+        case .geminiVideo:
+            contextLabel = "视频生成"
+        case .geminiChat:
+            contextLabel = "桌面对话"
+        case .petQuickChat:
+            contextLabel = "快捷对话"
+        case .antigravity, .antigravityIDE, .geminiAgent:
+            let ws = task.workspace.trimmingCharacters(in: .whitespacesAndNewlines)
+            contextLabel = (!ws.isEmpty && ws != "默认工作区") ? ws : "工作区"
+        }
+
         switch task.state {
         case .running:
-            let act = task.currentAction.isEmpty ? "思考中…" : task.currentAction
-            return "\(prefix)\(act)"
+            let act: String
+            if task.source == .geminiVideo {
+                act = task.hadPollingError ? "轮询波动重试中…" : "正在渲染生成…"
+            } else if task.source == .geminiChat {
+                act = "正在流式回复…"
+            } else {
+                act = task.currentAction.isEmpty ? "思考中…" : task.currentAction
+            }
+            return "\(contextLabel) · \(act)"
         case .error:
-            return "\(prefix)\(task.currentAction)"
+            return "\(contextLabel) · \(task.currentAction)"
         default:
-            return "\(prefix)\(task.title) · 完成"
+            if task.source == .geminiVideo {
+                return "视频生成 · 已完成 🎬"
+            }
+            return "\(contextLabel) · \(task.title) · 完成"
         }
     }
 

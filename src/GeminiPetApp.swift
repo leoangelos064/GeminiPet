@@ -83,9 +83,8 @@ enum AIModelPreset: String, CaseIterable {
 
 enum ActivePanelMode: Equatable {
     case none
-    case chat
+    case workspace   // Unified Task Group + Inline Conversation / Modify (ChatGPT Pet style)
     case voice
-    case activity
 }
 
 struct ChatEntry: Identifiable {
@@ -97,12 +96,53 @@ struct ChatEntry: Identifiable {
     let time: Date
 }
 
-struct ActivityEntry: Identifiable {
-    let id = UUID()
+enum TaskStateKind: String {
+    case running
+    case done
+    case error
+    case idle
+}
+
+struct TaskStepItem: Identifiable, Decodable {
+    var id: String { "\(time)-\(text)" }
+    let text: String
+    let time: Double
+}
+
+struct AgyTaskRecord: Decodable {
+    let id: String
+    let source: String?
     let title: String
-    let detail: String
-    let state: String // working, done, hiss, chat
-    let time: Date
+    let workspace: String
+    let workspacePath: String?
+    let state: String
+    let currentAction: String
+    let lastReply: String?
+    let startedAt: Double
+    let updatedAt: Double
+    let steps: [TaskStepItem]?
+}
+
+struct AgyTasksFile: Decodable {
+    let updatedAt: Double?
+    let tasks: [AgyTaskRecord]
+}
+
+/// Unified Task / Conversation Thread (represents either a live Antigravity task or a Pet quick-chat thread)
+struct PetTaskThread: Identifiable {
+    let id: String
+    let isAntigravity: Bool
+    var title: String
+    var workspace: String
+    var state: TaskStateKind
+    var currentAction: String
+    var startedAt: Date
+    var updatedAt: Date
+    var steps: [TaskStepItem]
+    var agyLastReply: String
+    var interactionId: String
+    var messages: [ChatEntry]
+    var unread: Bool
 }
 
 struct BridgeResponse: Decodable {
@@ -111,12 +151,6 @@ struct BridgeResponse: Decodable {
     let interaction_id: String?
     let audio_path: String?
     let error: String?
-}
-
-struct AgyStatusPayload: Decodable {
-    let state: String
-    let message: String?
-    let updatedAt: Double?
 }
 
 // MARK: - Voice Recorder & Audio Player
@@ -216,7 +250,7 @@ final class VoiceController: NSObject, ObservableObject, AVAudioPlayerDelegate {
                     return
                 }
             } catch {
-                // Fall through to system speech
+                // Fall back to system speech
             }
         }
         speakSystemTTS(fallbackText)
@@ -233,7 +267,6 @@ final class VoiceController: NSObject, ObservableObject, AVAudioPlayerDelegate {
         utter.rate = AVSpeechUtteranceDefaultSpeechRate * 1.04
         isSpeaking = true
         synthesizer.speak(utter)
-        // Reset speaking indicator cleanly after estimated duration
         let approxSec = max(1.8, min(20.0, Double(clean.count) * 0.22))
         Task {
             try? await Task.sleep(nanoseconds: UInt64(approxSec * 1_000_000_000))
@@ -264,13 +297,14 @@ final class VoiceController: NSObject, ObservableObject, AVAudioPlayerDelegate {
 @MainActor
 final class PetViewModel: ObservableObject {
     @Published var mood: PetMood = .idle
-    @Published var bubbleText: String? = "哈基米已就位 · 悬停或 ⌥G 对话 ✦"
-    @Published var showBubble: Bool = true
     @Published var isHovering: Bool = false
     @Published var activePanel: ActivePanelMode = .none {
         didSet { onPanelModeChanged?(activePanel) }
     }
     @Published var miniMode: Bool = false {
+        didSet { onSizeChanged?() }
+    }
+    @Published var alwaysShowTaskBar: Bool = true {
         didSet { onSizeChanged?() }
     }
     @Published var isFacingLeft: Bool = false
@@ -287,17 +321,15 @@ final class PetViewModel: ObservableObject {
     @Published var agySyncEnabled: Bool = true
     @Published var isVisible: Bool = true
 
-    // Quick Chat & Screen & Voice & Activity state
+    // Unified Multi-Task Group State (Antigravity live tasks + Pet chat threads)
+    @Published var tasks: [PetTaskThread] = []
+    @Published var selectedTaskId: String = ""
     @Published var inputText: String = ""
-    @Published var isThinking: Bool = false
     @Published var attachedScreenPath: String? = nil
-    @Published var messages: [ChatEntry] = []
-    @Published var activities: [ActivityEntry] = [
-        ActivityEntry(title: "哈基米桌宠已启动", detail: "悬停可快速输入、语音对话或看屏幕提问", state: "done", time: Date())
-    ]
-    @Published var unreadCount: Int = 0
     @Published var voiceStatusHint: String = "点击麦克风开始说话"
+    @Published var quickToast: String? = nil
     @Published var focusInputTrigger: UUID = UUID()
+    @Published var nowTick: Date = Date()
 
     let voice = VoiceController()
 
@@ -310,28 +342,76 @@ final class PetViewModel: ObservableObject {
 
     private var lastInteractionDate = Date()
     private var recentPokeTimestamps: [Date] = []
-    private var bubbleDismissTask: Task<Void, Never>?
+    private var toastDismissTask: Task<Void, Never>?
     private var hoverHideTask: Task<Void, Never>?
     private var moodResetTask: Task<Void, Never>?
     private var tickTimer: Timer?
     private var wanderDirection: CGFloat = -1
     private var wanderPauseUntil: Date = .distantPast
-    private var lastAgyUpdatedAt: Double = 0
+    private var lastTasksFileUpdatedAt: Double = 0
     private var isDragging = false
-    private var previousInteractionId: String = ""
     private var voiceCancellable: AnyCancellable?
 
-    private let happyLines = ["呼噜~ ✦", "摸摸头 💗", "在呢喵~", "随时听候差遣 ✦"]
+    private let happyLines = ["呼噜~ ✦", "摸摸头 💗", "在呢喵~", "随时待命 ✦"]
     private let hissLines = ["哈——！💢", "别一直戳啦！", "炸毛了喵 💢"]
 
     init() {
         loadSprites()
+        // Seed one default Pet chat thread so the task group always has a ready workspace
+        let defaultId = "pet-main"
+        tasks = [
+            PetTaskThread(
+                id: defaultId,
+                isAntigravity: false,
+                title: "快捷对话",
+                workspace: "哈基米工作区",
+                state: .idle,
+                currentAction: "空闲待命中",
+                startedAt: Date(),
+                updatedAt: Date(),
+                steps: [],
+                agyLastReply: "",
+                interactionId: "",
+                messages: [],
+                unread: false
+            )
+        ]
+        selectedTaskId = defaultId
+        pollAgyTasks(initialLoad: true)
         startTimers()
-        scheduleBubbleDismiss(after: 3.0)
-        // Forward voice observable changes so SwiftUI re-renders cleanly
         voiceCancellable = voice.objectWillChange.sink { [weak self] _ in
             self?.objectWillChange.send()
         }
+    }
+
+    var runningTasksCount: Int {
+        tasks.filter { $0.state == .running }.count
+    }
+
+    var unreadCount: Int {
+        tasks.filter { $0.unread }.count
+    }
+
+    /// Primary task displayed in the persistent top Task & Workspace strip
+    var bannerTask: PetTaskThread? {
+        if let running = tasks.first(where: { $0.state == .running }) {
+            return running
+        }
+        if let unreadTask = tasks.first(where: { $0.unread }) {
+            return unreadTask
+        }
+        if let selected = tasks.first(where: { $0.id == selectedTaskId }) {
+            return selected
+        }
+        return tasks.first
+    }
+
+    var selectedTask: PetTaskThread? {
+        tasks.first(where: { $0.id == selectedTaskId }) ?? tasks.first
+    }
+
+    var isAnyTaskThinking: Bool {
+        runningTasksCount > 0
     }
 
     private func loadSprites() {
@@ -365,7 +445,7 @@ final class PetViewModel: ObservableObject {
     }
 
     private func startTimers() {
-        tickTimer = Timer.scheduledTimer(withTimeInterval: 0.08, repeats: true) { [weak self] _ in
+        tickTimer = Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { [weak self] _ in
             Task { @MainActor in
                 self?.onTick()
             }
@@ -377,14 +457,19 @@ final class PetViewModel: ObservableObject {
         tickCount += 1
         let now = Date()
 
+        // Update elapsed timer display every 1s when any task is running
+        if tickCount % 10 == 0 && runningTasksCount > 0 {
+            nowTick = now
+        }
+
         if !isDragging && abs(dragTiltDegrees) > 0.1 {
             dragTiltDegrees *= 0.78
             if abs(dragTiltDegrees) < 0.15 { dragTiltDegrees = 0 }
         }
 
-        if !isDragging && !isThinking && !voice.isRecording && activePanel == .none
+        if !isDragging && !isAnyTaskThinking && !voice.isRecording && activePanel == .none
             && mood == .idle && now.timeIntervalSince(lastInteractionDate) > 180 {
-            setMood(.sleep, autoResetAfter: nil, speech: nil)
+            setMood(.sleep, autoResetAfter: nil)
         }
 
         if wanderEnabled && !miniMode && !isDragging && activePanel == .none && mood == .idle && now > wanderPauseUntil {
@@ -407,59 +492,175 @@ final class PetViewModel: ObservableObject {
             }
         }
 
-        if agySyncEnabled && tickCount % 6 == 0 {
-            pollAgyStatus()
+        // Poll Antigravity multi-task registry every 0.4s
+        if agySyncEnabled && tickCount % 4 == 0 {
+            pollAgyTasks(initialLoad: false)
         }
     }
 
-    private func pollAgyStatus() {
-        let statusURL = FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent(".gemini/gemini_pet_status.json")
-        guard let data = try? Data(contentsOf: statusURL),
-              let payload = try? JSONDecoder().decode(AgyStatusPayload.self, from: data) else {
+    private func pollAgyTasks(initialLoad: Bool) {
+        let tasksURL = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(".gemini/gemini_pet_tasks.json")
+        guard let data = try? Data(contentsOf: tasksURL),
+              let file = try? JSONDecoder().decode(AgyTasksFile.self, from: data) else {
             return
         }
-        let ts = payload.updatedAt ?? 0
-        guard ts > lastAgyUpdatedAt else { return }
-        lastAgyUpdatedAt = ts
+        let ts = file.updatedAt ?? 0
+        if !initialLoad && ts <= lastTasksFileUpdatedAt { return }
+        lastTasksFileUpdatedAt = ts
 
-        if Date().timeIntervalSince1970 - ts > 60 { return }
+        var sawNewlyRunning = false
+        var sawNewlyDone = false
+        var sawNewlyError = false
 
+        for rec in file.tasks {
+            let kind: TaskStateKind = {
+                switch rec.state {
+                case "running": return .running
+                case "error": return .error
+                case "done": return .done
+                default: return .idle
+                }
+            }()
+
+            if let idx = tasks.firstIndex(where: { $0.id == rec.id }) {
+                let prevState = tasks[idx].state
+                tasks[idx].title = rec.title
+                tasks[idx].workspace = rec.workspace
+                tasks[idx].state = kind
+                tasks[idx].currentAction = rec.currentAction
+                tasks[idx].startedAt = Date(timeIntervalSince1970: rec.startedAt)
+                tasks[idx].updatedAt = Date(timeIntervalSince1970: rec.updatedAt)
+                tasks[idx].steps = rec.steps ?? []
+                if let rep = rec.lastReply, !rep.isEmpty {
+                    tasks[idx].agyLastReply = rep
+                }
+                if !initialLoad {
+                    if kind == .running { sawNewlyRunning = true }
+                    if prevState == .running && kind == .done {
+                        sawNewlyDone = true
+                        if activePanel != .workspace || selectedTaskId != rec.id {
+                            tasks[idx].unread = true
+                        }
+                    }
+                    if prevState != .error && kind == .error {
+                        sawNewlyError = true
+                        tasks[idx].unread = true
+                    }
+                }
+            } else {
+                let thread = PetTaskThread(
+                    id: rec.id,
+                    isAntigravity: true,
+                    title: rec.title,
+                    workspace: rec.workspace,
+                    state: kind,
+                    currentAction: rec.currentAction,
+                    startedAt: Date(timeIntervalSince1970: rec.startedAt),
+                    updatedAt: Date(timeIntervalSince1970: rec.updatedAt),
+                    steps: rec.steps ?? [],
+                    agyLastReply: rec.lastReply ?? "",
+                    interactionId: "",
+                    messages: [],
+                    unread: !initialLoad && kind == .done
+                )
+                tasks.insert(thread, at: 0)
+                if !initialLoad {
+                    if kind == .running { sawNewlyRunning = true }
+                    if kind == .done { sawNewlyDone = true }
+                    if kind == .error { sawNewlyError = true }
+                }
+            }
+        }
+
+        // Keep running tasks at the front, then sorted by updatedAt descending
+        tasks.sort { lhs, rhs in
+            if (lhs.state == .running) != (rhs.state == .running) {
+                return lhs.state == .running
+            }
+            return lhs.updatedAt > rhs.updatedAt
+        }
+
+        if !initialLoad {
+            lastInteractionDate = Date()
+            if sawNewlyRunning {
+                setMood(.working, autoResetAfter: nil)
+            } else if sawNewlyError {
+                setMood(.hiss, autoResetAfter: 4.0)
+            } else if sawNewlyDone {
+                setMood(.happy, autoResetAfter: 4.0)
+            } else if runningTasksCount == 0 && mood == .working {
+                setMood(.idle, autoResetAfter: nil)
+            }
+        }
+    }
+
+    // MARK: - Task Group Operations
+
+    func selectTask(_ id: String) {
+        selectedTaskId = id
+        if let idx = tasks.firstIndex(where: { $0.id == id }) {
+            tasks[idx].unread = false
+        }
+        focusInputTrigger = UUID()
+    }
+
+    func createNewPetTask() {
+        let newId = "pet-\(Int(Date().timeIntervalSince1970))-\(Int.random(in: 100...999))"
+        let count = tasks.filter { !$0.isAntigravity }.count + 1
+        let thread = PetTaskThread(
+            id: newId,
+            isAntigravity: false,
+            title: "新任务 #\(count)",
+            workspace: "哈基米工作区",
+            state: .idle,
+            currentAction: "等待输入指令",
+            startedAt: Date(),
+            updatedAt: Date(),
+            steps: [],
+            agyLastReply: "",
+            interactionId: "",
+            messages: [],
+            unread: false
+        )
+        tasks.insert(thread, at: 0)
+        selectedTaskId = newId
+        attachedScreenPath = nil
+        focusInputTrigger = UUID()
+    }
+
+    func openWorkspacePanel(focusTaskId: String? = nil) {
         lastInteractionDate = Date()
-        let msg = payload.message ?? ""
-        switch payload.state {
-        case "working":
-            if !isThinking {
-                setMood(.working, autoResetAfter: 45, speech: "思考中… ✦")
-            }
-            pushActivity(title: "Antigravity 运行中", detail: msg.isEmpty ? "正在执行任务" : msg, state: "working", markUnread: false)
-        case "done":
-            if !isThinking {
-                setMood(.happy, autoResetAfter: 4.0, speech: "任务完成 ✦")
-            }
-            pushActivity(title: "Antigravity 任务完成", detail: msg.isEmpty ? "可以切回去查看结果啦" : msg, state: "done", markUnread: true)
-        case "hiss":
-            if !isThinking {
-                setMood(.hiss, autoResetAfter: 3.5, speech: "出错了 💢")
-            }
-            pushActivity(title: "Antigravity 遇到错误", detail: msg.isEmpty ? "请检查最近一次操作" : msg, state: "hiss", markUnread: true)
-        default:
-            if !isThinking {
-                setMood(.idle, autoResetAfter: nil, speech: nil)
-            }
+        if let tid = focusTaskId {
+            selectTask(tid)
+        } else if let bt = bannerTask {
+            selectTask(bt.id)
+        }
+        if activePanel == .workspace && focusTaskId == nil {
+            closePanel()
+            return
+        }
+        if voice.isRecording {
+            voice.cancelRecording()
+        }
+        activePanel = .workspace
+        focusInputTrigger = UUID()
+    }
+
+    func openVoicePanelAndRecord() {
+        lastInteractionDate = Date()
+        activePanel = .voice
+        if !voice.isRecording {
+            toggleVoiceRecording()
         }
     }
 
-    private func pushActivity(title: String, detail: String, state: String, markUnread: Bool) {
-        let entry = ActivityEntry(title: title, detail: detail, state: state, time: Date())
-        activities.insert(entry, at: 0)
-        if activities.count > 20 { activities.removeLast() }
-        if markUnread && activePanel != .activity {
-            unreadCount += 1
+    func closePanel() {
+        if voice.isRecording {
+            voice.cancelRecording()
         }
+        activePanel = .none
     }
-
-    // MARK: - Hover & Panel Controls
 
     func setHovering(_ hovering: Bool) {
         hoverHideTask?.cancel()
@@ -482,84 +683,53 @@ final class PetViewModel: ObservableObject {
         }
     }
 
-    func openPanel(_ mode: ActivePanelMode) {
-        lastInteractionDate = Date()
-        if mode == .activity {
-            unreadCount = 0
-        }
-        if activePanel == mode {
-            closePanel()
-            return
-        }
-        if voice.isRecording && mode != .voice {
-            voice.cancelRecording()
-        }
-        activePanel = mode
-        if mode == .chat {
-            focusInputTrigger = UUID()
-        }
-    }
+    // MARK: - Inline Send / Modify Inside Selected Task
 
-    func closePanel() {
-        if voice.isRecording {
-            voice.cancelRecording()
+    func sendModifyToAntigravity() {
+        let text = inputText.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !text.isEmpty {
+            NSPasteboard.general.clearContents()
+            NSPasteboard.general.setString(text, forType: .string)
+            inputText = ""
+            showToast("已复制修改指令，正在切回 Antigravity 粘贴 ✦")
         }
-        activePanel = .none
-    }
-
-    // MARK: - Quick Chat / Screen Capture / Voice Mode
-
-    func captureScreenContext() {
-        lastInteractionDate = Date()
-        let outURL = FileManager.default.temporaryDirectory
-            .appendingPathComponent("geminipet_screen_\(Int(Date().timeIntervalSince1970)).png")
-        let proc = Process()
-        proc.executableURL = URL(fileURLWithPath: "/usr/sbin/screencapture")
-        proc.arguments = ["-x", outURL.path]
-        do {
-            try proc.run()
-            proc.waitUntilExit()
-            if proc.terminationStatus == 0 && FileManager.default.fileExists(atPath: outURL.path) {
-                attachedScreenPath = outURL.path
-                say("已截取当前屏幕 📸", duration: 2.0)
-                if activePanel == .none {
-                    activePanel = .chat
-                    focusInputTrigger = UUID()
-                }
-            } else {
-                say("截屏失败，请检查录屏权限", duration: 2.6)
-            }
-        } catch {
-            say("截屏失败", duration: 2.4)
-        }
-    }
-
-    func clearAttachedScreen() {
-        if let p = attachedScreenPath {
-            try? FileManager.default.removeItem(atPath: p)
-        }
-        attachedScreenPath = nil
-    }
-
-    func startNewChat() {
-        previousInteractionId = ""
-        messages.removeAll()
-        clearAttachedScreen()
-        say("已开启新对话 ✦", duration: 1.8)
+        openApp(named: "/Applications/Antigravity.app")
     }
 
     func sendTextPrompt() {
         let text = inputText.trimmingCharacters(in: .whitespacesAndNewlines)
         let imgPath = attachedScreenPath
         guard !text.isEmpty || imgPath != nil else { return }
-        guard !isThinking else { return }
 
+        guard let taskIdx = tasks.firstIndex(where: { $0.id == selectedTaskId }) ?? (tasks.isEmpty ? nil : 0) else {
+            return
+        }
+        guard tasks[taskIdx].state != .running || tasks[taskIdx].isAntigravity else { return }
+
+        let taskId = tasks[taskIdx].id
         let displayPrompt = text.isEmpty ? "看看我当前屏幕里的内容" : text
-        messages.append(ChatEntry(isUser: true, text: displayPrompt, hasImage: imgPath != nil, isVoice: false, time: Date()))
+
+        // Update title on first prompt of a fresh pet thread
+        if !tasks[taskIdx].isAntigravity && tasks[taskIdx].messages.isEmpty {
+            let short = displayPrompt.count > 20 ? String(displayPrompt.prefix(20)) + "…" : displayPrompt
+            tasks[taskIdx].title = short
+        }
+
+        tasks[taskIdx].messages.append(ChatEntry(isUser: true, text: displayPrompt, hasImage: imgPath != nil, isVoice: false, time: Date()))
         inputText = ""
         attachedScreenPath = nil
 
-        callBridge(prompt: text, audioPath: nil, imagePath: imgPath, speak: false)
+        // If user is modifying/following up on an Antigravity task right inside this conversation,
+        // automatically inject that task's context on the first follow-up turn!
+        var effectivePrompt = text
+        if tasks[taskIdx].isAntigravity && tasks[taskIdx].interactionId.isEmpty {
+            let ctxSummary = tasks[taskIdx].agyLastReply.isEmpty
+                ? tasks[taskIdx].currentAction
+                : String(tasks[taskIdx].agyLastReply.prefix(320))
+            effectivePrompt = "【当前工作区：\(tasks[taskIdx].workspace)｜当前任务：\(tasks[taskIdx].title)｜最新进展：\(ctxSummary)】\n用户追加修改/追问：\(displayPrompt)"
+        }
+
+        callBridge(forTaskId: taskId, prompt: effectivePrompt, audioPath: nil, imagePath: imgPath, speak: false)
     }
 
     func toggleVoiceRecording() {
@@ -569,8 +739,11 @@ final class PetViewModel: ObservableObject {
             let imgPath = attachedScreenPath
             attachedScreenPath = nil
             voiceStatusHint = "正在听懂并思考回复…"
-            messages.append(ChatEntry(isUser: true, text: "🎙 语音消息（\(max(1, voice.recordingSeconds))s）", hasImage: imgPath != nil, isVoice: true, time: Date()))
-            callBridge(prompt: "", audioPath: audioURL.path, imagePath: imgPath, speak: true)
+            let targetId = selectedTask?.id ?? tasks.first?.id ?? "pet-main"
+            if let idx = tasks.firstIndex(where: { $0.id == targetId }) {
+                tasks[idx].messages.append(ChatEntry(isUser: true, text: "🎙 语音消息（\(max(1, voice.recordingSeconds))s）", hasImage: imgPath != nil, isVoice: true, time: Date()))
+            }
+            callBridge(forTaskId: targetId, prompt: "", audioPath: audioURL.path, imagePath: imgPath, speak: true)
         } else {
             if activePanel != .voice {
                 activePanel = .voice
@@ -579,21 +752,29 @@ final class PetViewModel: ObservableObject {
                 guard let self else { return }
                 if ok {
                     self.voiceStatusHint = "正在聆听… 说完点「停止并发送」"
-                    self.setMood(.idle, autoResetAfter: nil, speech: "聆听中… 🎙")
+                    self.showToast("聆听中… 🎙")
                 } else {
                     self.voiceStatusHint = err ?? "无法开启麦克风"
-                    self.say(err ?? "麦克风权限未开", duration: 3.0)
+                    self.showToast(err ?? "麦克风权限未开")
                 }
             }
         }
     }
 
-    private func callBridge(prompt: String, audioPath: String?, imagePath: String?, speak: Bool) {
-        isThinking = true
-        setMood(.working, autoResetAfter: nil, speech: speak ? "思考语音回复…" : "思考中… ✦")
+    private func callBridge(forTaskId taskId: String, prompt: String, audioPath: String?, imagePath: String?, speak: Bool) {
+        let prevId: String
+        if let idx = tasks.firstIndex(where: { $0.id == taskId }) {
+            prevId = tasks[idx].interactionId
+            tasks[idx].state = .running
+            tasks[idx].startedAt = Date()
+            tasks[idx].updatedAt = Date()
+            tasks[idx].currentAction = speak ? "理解语音并生成回复…" : "思考与处理修改中…"
+        } else {
+            prevId = ""
+        }
 
+        setMood(.working, autoResetAfter: nil)
         let script = bridgeScriptPath()
-        let prevId = previousInteractionId
         let model = modelPreset.rawValue
 
         Task { [weak self] in
@@ -635,28 +816,68 @@ final class PetViewModel: ObservableObject {
             }.value
 
             guard let self else { return }
-            self.isThinking = false
-            if parsed.ok, let reply = parsed.text, !reply.isEmpty {
-                if let nid = parsed.interaction_id, !nid.isEmpty {
-                    self.previousInteractionId = nid
+            if let idx = self.tasks.firstIndex(where: { $0.id == taskId }) {
+                self.tasks[idx].updatedAt = Date()
+                if parsed.ok, let reply = parsed.text, !reply.isEmpty {
+                    if let nid = parsed.interaction_id, !nid.isEmpty {
+                        self.tasks[idx].interactionId = nid
+                    }
+                    self.tasks[idx].messages.append(ChatEntry(isUser: false, text: reply, hasImage: false, isVoice: speak, time: Date()))
+                    self.tasks[idx].state = .done
+                    self.tasks[idx].currentAction = "已完成 · 可继续修改"
+                    if self.activePanel == .none || self.selectedTaskId != taskId {
+                        self.tasks[idx].unread = true
+                    }
+                    self.setMood(.happy, autoResetAfter: 3.5)
+                    if speak {
+                        self.voiceStatusHint = "正在播报回复（可随时打断再说）"
+                        self.voice.playAudioOrSpeak(audioPath: parsed.audio_path, fallbackText: reply)
+                    }
+                } else {
+                    let err = parsed.error ?? "未知错误"
+                    self.tasks[idx].messages.append(ChatEntry(isUser: false, text: "出错啦：\(err)", hasImage: false, isVoice: false, time: Date()))
+                    self.tasks[idx].state = .error
+                    self.tasks[idx].currentAction = "执行出错"
+                    self.voiceStatusHint = "出错：\(err)"
+                    self.setMood(.hiss, autoResetAfter: 3.5)
                 }
-                self.messages.append(ChatEntry(isUser: false, text: reply, hasImage: false, isVoice: speak, time: Date()))
-                self.pushActivity(title: speak ? "语音回复" : "快捷对话回复", detail: reply, state: "chat", markUnread: self.activePanel == .none)
-                self.setMood(.happy, autoResetAfter: 3.5, speech: speak ? "播报中… 🔊" : "回复好啦 ✦")
-                if speak {
-                    self.voiceStatusHint = "正在播报回复（可随时打断再说）"
-                    self.voice.playAudioOrSpeak(audioPath: parsed.audio_path, fallbackText: reply)
-                }
-            } else {
-                let err = parsed.error ?? "未知错误"
-                self.messages.append(ChatEntry(isUser: false, text: "出错啦：\(err)", hasImage: false, isVoice: false, time: Date()))
-                self.voiceStatusHint = "出错：\(err)"
-                self.setMood(.hiss, autoResetAfter: 3.5, speech: "请求失败 💢")
             }
         }
     }
 
-    // MARK: - Pet Click / Drag Interactions
+    func captureScreenContext() {
+        lastInteractionDate = Date()
+        let outURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("geminipet_screen_\(Int(Date().timeIntervalSince1970)).png")
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: "/usr/sbin/screencapture")
+        proc.arguments = ["-x", outURL.path]
+        do {
+            try proc.run()
+            proc.waitUntilExit()
+            if proc.terminationStatus == 0 && FileManager.default.fileExists(atPath: outURL.path) {
+                attachedScreenPath = outURL.path
+                showToast("已附带当前屏幕 📸")
+                if activePanel == .none {
+                    activePanel = .workspace
+                    focusInputTrigger = UUID()
+                }
+            } else {
+                showToast("截屏失败，请检查录屏权限")
+            }
+        } catch {
+            showToast("截屏失败")
+        }
+    }
+
+    func clearAttachedScreen() {
+        if let p = attachedScreenPath {
+            try? FileManager.default.removeItem(atPath: p)
+        }
+        attachedScreenPath = nil
+    }
+
+    // MARK: - Click / Drag / Toast
 
     func handleSingleClick() {
         lastInteractionDate = Date()
@@ -666,20 +887,28 @@ final class PetViewModel: ObservableObject {
 
         if recentPokeTimestamps.count >= 5 {
             recentPokeTimestamps.removeAll()
-            setMood(.hiss, autoResetAfter: 2.8, speech: hissLines.randomElement()!)
+            setMood(.hiss, autoResetAfter: 2.8)
+            showToast(hissLines.randomElement()!)
             return
         }
 
         if mood == .sleep {
-            setMood(.idle, autoResetAfter: nil, speech: "醒啦 ✦")
+            setMood(.idle, autoResetAfter: nil)
+            showToast("醒啦 ✦")
             return
         }
 
-        setMood(.happy, autoResetAfter: 2.2, speech: happyLines.randomElement()!)
+        if runningTasksCount > 0 {
+            openWorkspacePanel()
+            return
+        }
+
+        setMood(.happy, autoResetAfter: 2.2)
+        showToast(happyLines.randomElement()!)
     }
 
     func handleDoubleClick() {
-        openPanel(.chat)
+        openWorkspacePanel()
     }
 
     func beginDrag() {
@@ -702,43 +931,22 @@ final class PetViewModel: ObservableObject {
     func endDrag() {
         isDragging = false
         lastInteractionDate = Date()
-        if !isThinking {
-            mood = .idle
-        }
+        mood = runningTasksCount > 0 ? .working : .idle
     }
 
-    func selectManualMood(_ newMood: PetMood) {
-        lastInteractionDate = Date()
-        switch newMood {
-        case .idle: setMood(.idle, autoResetAfter: nil, speech: nil)
-        case .happy: setMood(.happy, autoResetAfter: 3.0, speech: happyLines.randomElement()!)
-        case .working: setMood(.working, autoResetAfter: nil, speech: "干活中 ✦")
-        case .hiss: setMood(.hiss, autoResetAfter: 3.0, speech: hissLines.randomElement()!)
-        case .sleep: setMood(.sleep, autoResetAfter: nil, speech: "Zzz")
-        case .drag: setMood(.drag, autoResetAfter: 2.5, speech: nil)
-        }
-    }
-
-    func setMood(_ newMood: PetMood, autoResetAfter seconds: Double?, speech: String? = nil) {
+    func setMood(_ newMood: PetMood, autoResetAfter seconds: Double?) {
         moodResetTask?.cancel()
         withAnimation(.easeInOut(duration: 0.14)) {
             mood = newMood
-        }
-        if let text = speech {
-            say(text, duration: 2.4)
-        } else {
-            withAnimation(.easeOut(duration: 0.18)) {
-                showBubble = false
-            }
         }
         if let seconds {
             moodResetTask = Task { [weak self] in
                 try? await Task.sleep(nanoseconds: UInt64(seconds * 1_000_000_000))
                 guard !Task.isCancelled else { return }
                 await MainActor.run {
-                    if self?.isDragging == false && self?.isThinking == false {
+                    if let self, !self.isDragging {
                         withAnimation(.easeInOut(duration: 0.2)) {
-                            self?.mood = .idle
+                            self.mood = self.runningTasksCount > 0 ? .working : .idle
                         }
                     }
                 }
@@ -746,25 +954,23 @@ final class PetViewModel: ObservableObject {
         }
     }
 
-    func say(_ text: String, duration: Double = 2.2) {
-        bubbleText = text
-        withAnimation(.easeOut(duration: 0.15)) {
-            showBubble = true
-        }
-        scheduleBubbleDismiss(after: duration)
-    }
-
-    private func scheduleBubbleDismiss(after seconds: Double) {
-        bubbleDismissTask?.cancel()
-        bubbleDismissTask = Task { [weak self] in
-            try? await Task.sleep(nanoseconds: UInt64(seconds * 1_000_000_000))
+    func showToast(_ text: String, duration: Double = 2.0) {
+        quickToast = text
+        toastDismissTask?.cancel()
+        toastDismissTask = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: UInt64(duration * 1_000_000_000))
             guard !Task.isCancelled else { return }
             await MainActor.run {
-                withAnimation(.easeOut(duration: 0.22)) {
-                    self?.showBubble = false
+                withAnimation(.easeOut(duration: 0.2)) {
+                    self?.quickToast = nil
                 }
             }
         }
+    }
+
+    func elapsedString(since start: Date) -> String {
+        let secs = max(0, Int(nowTick.timeIntervalSince(start)))
+        return String(format: "%d:%02d", secs / 60, secs % 60)
     }
 
     func openApp(named path: String) {
@@ -775,7 +981,7 @@ final class PetViewModel: ObservableObject {
     }
 }
 
-// MARK: - Floating Pet View (Character + Hover Controls + Mini Mode)
+// MARK: - Floating Pet View (Persistent Workspace/Task Bar + Pet + Hover Controls)
 
 struct PetContentView: View {
     @ObservedObject var vm: PetViewModel
@@ -783,38 +989,107 @@ struct PetContentView: View {
 
     var body: some View {
         let s = vm.petSize.rawValue
-        let showControls = vm.isHovering || vm.activePanel != .none || vm.voice.isRecording || vm.miniMode
+        let showControls = vm.isHovering || vm.activePanel != .none || vm.voice.isRecording || vm.miniMode || vm.runningTasksCount > 0
+        let showTopStrip = vm.alwaysShowTaskBar || vm.runningTasksCount > 0 || vm.unreadCount > 0 || vm.quickToast != nil
 
         TimelineView(.animation(minimumInterval: vm.motionStyle == .still ? 0.25 : 1.0 / 24.0)) { timeline in
             let t = timeline.date.timeIntervalSinceReferenceDate
             let anim = computeAnimation(t: t, mood: vm.mood, style: vm.motionStyle)
 
-            VStack(spacing: 3) {
-                if !vm.miniMode {
-                    // Compact Status Bubble (hidden when PanelWindow is open to avoid overlap)
-                    ZStack {
-                        if vm.activePanel == .none && vm.showBubble, let text = vm.bubbleText {
-                            Text(text)
-                                .font(.system(size: 10.5, weight: .medium, design: .rounded))
-                                .foregroundColor(.white.opacity(0.95))
-                                .lineLimit(1)
-                                .padding(.horizontal, 8)
-                                .padding(.vertical, 3.5)
-                                .background(
-                                    Capsule()
-                                        .fill(Color(red: 0.10, green: 0.10, blue: 0.18).opacity(0.88))
-                                        .overlay(
-                                            Capsule()
-                                                .strokeBorder(Color(red: 0.62, green: 0.58, blue: 1.0).opacity(0.45), lineWidth: 0.8)
-                                        )
-                                        .shadow(color: .black.opacity(0.22), radius: 4, y: 2)
-                                )
-                                .transition(.opacity)
-                        }
-                    }
-                    .frame(height: 24, alignment: .bottom)
+            VStack(spacing: 4) {
+                // 1. PERSISTENT TOP WORKSPACE & TASK BAR (ChatGPT Pet style — stays visible while working!)
+                ZStack {
+                    if showTopStrip, let bt = vm.bannerTask {
+                        Button {
+                            vm.openWorkspacePanel(focusTaskId: bt.id)
+                        } label: {
+                            VStack(alignment: .leading, spacing: 2.5) {
+                                // Row 1: Workspace Name + Task Group Counter Badge
+                                HStack(spacing: 5) {
+                                    Image(systemName: bt.isAntigravity ? "folder.fill" : "sparkles")
+                                        .font(.system(size: 8.5, weight: .semibold))
+                                        .foregroundColor(Color(red: 0.68, green: 0.74, blue: 1.0))
+                                    Text(bt.workspace)
+                                        .font(.system(size: 9.5, weight: .semibold, design: .rounded))
+                                        .foregroundColor(.white.opacity(0.75))
+                                        .lineLimit(1)
+                                    Spacer(minLength: 4)
 
-                    // Pet Sprite + Status Dot
+                                    // Task group pill
+                                    HStack(spacing: 3) {
+                                        if vm.runningTasksCount > 0 {
+                                            Circle()
+                                                .fill(Color(red: 0.38, green: 0.78, blue: 1.0))
+                                                .frame(width: 5.5, height: 5.5)
+                                                .opacity(0.65 + sin(t * 5.0) * 0.35)
+                                            Text("运行 \(vm.runningTasksCount)/\(vm.tasks.count)")
+                                        } else if vm.unreadCount > 0 {
+                                            Circle()
+                                                .fill(Color(red: 1.0, green: 0.78, blue: 0.32))
+                                                .frame(width: 5.5, height: 5.5)
+                                            Text("新完成 \(vm.unreadCount)")
+                                        } else {
+                                            Text("任务组 \(vm.tasks.count)")
+                                        }
+                                    }
+                                    .font(.system(size: 9, weight: .medium, design: .rounded))
+                                    .foregroundColor(.white.opacity(0.86))
+                                    .padding(.horizontal, 5.5)
+                                    .padding(.vertical, 1.5)
+                                    .background(Capsule().fill(Color.white.opacity(0.11)))
+                                }
+
+                                // Row 2: Active Task / Step / Toast + Live Elapsed Timer
+                                HStack(spacing: 5) {
+                                    Circle()
+                                        .fill(taskDotColor(bt.state))
+                                        .frame(width: 6, height: 6)
+                                        .scaleEffect(bt.state == .running ? (1.0 + sin(t * 6.0) * 0.2) : 1.0)
+
+                                    Text(vm.quickToast ?? (bt.state == .running ? bt.currentAction : bt.title))
+                                        .font(.system(size: 10.5, weight: .medium, design: .rounded))
+                                        .foregroundColor(.white.opacity(0.95))
+                                        .lineLimit(1)
+
+                                    Spacer(minLength: 2)
+
+                                    if bt.state == .running {
+                                        Text(vm.elapsedString(since: bt.startedAt))
+                                            .font(.system(size: 9.5, weight: .medium, design: .monospaced))
+                                            .foregroundColor(Color(red: 0.62, green: 0.84, blue: 1.0))
+                                    } else {
+                                        Image(systemName: "chevron.up.chevron.down")
+                                            .font(.system(size: 8.5, weight: .semibold))
+                                            .foregroundColor(.white.opacity(0.42))
+                                    }
+                                }
+                            }
+                            .padding(.horizontal, 9)
+                            .padding(.vertical, 6)
+                            .frame(width: 196)
+                            .background(
+                                RoundedRectangle(cornerRadius: 11, style: .continuous)
+                                    .fill(Color(red: 0.10, green: 0.09, blue: 0.18).opacity(0.90))
+                                    .overlay(
+                                        RoundedRectangle(cornerRadius: 11, style: .continuous)
+                                            .strokeBorder(
+                                                bt.state == .running
+                                                    ? Color(red: 0.48, green: 0.74, blue: 1.0).opacity(0.65)
+                                                    : Color(red: 0.62, green: 0.58, blue: 1.0).opacity(0.38),
+                                                lineWidth: 0.9
+                                            )
+                                    )
+                                    .shadow(color: .black.opacity(0.26), radius: 6, y: 2)
+                            )
+                        }
+                        .buttonStyle(.plain)
+                        .help("点击展开任务组与对话修改")
+                    }
+                }
+                .frame(height: 44, alignment: .bottom)
+
+                // 2. PET SPRITE
+                if !vm.miniMode {
                     ZStack(alignment: .bottomTrailing) {
                         if let nsImg = vm.currentImage() {
                             Image(nsImage: nsImg)
@@ -826,17 +1101,6 @@ struct PetContentView: View {
                                 .rotationEffect(.degrees(anim.rotation + vm.dragTiltDegrees))
                                 .offset(x: anim.offsetX, y: anim.offsetY)
                                 .shadow(color: Color.black.opacity(0.22), radius: 4, x: 0, y: 2.5)
-                        }
-
-                        // Subtle ChatGPT-style live status dot
-                        if let dotColor = liveStatusDotColor() {
-                            Circle()
-                                .fill(dotColor)
-                                .frame(width: 9, height: 9)
-                                .overlay(Circle().stroke(Color(red: 0.1, green: 0.1, blue: 0.18), lineWidth: 1.5))
-                                .shadow(color: dotColor.opacity(0.8), radius: 4)
-                                .scaleEffect(1.0 + sin(t * 5.0) * 0.15)
-                                .offset(x: -8, y: -6)
                         }
                     }
                     .frame(width: s + 8, height: s + 4)
@@ -856,12 +1120,11 @@ struct PetContentView: View {
                     )
                 }
 
-                // Hover Controls / Mini Mode Bar (ChatGPT Pet signature attached controls!)
+                // 3. ATTACHED BOTTOM QUICK BAR (Stays visible while hovered, working, or in Mini Mode)
                 ZStack {
                     if showControls {
                         HStack(spacing: 4) {
                             if vm.miniMode {
-                                // Drag grip in Mini Mode
                                 Text("✦")
                                     .font(.system(size: 12, weight: .bold))
                                     .foregroundColor(Color(red: 0.72, green: 0.76, blue: 1.0))
@@ -869,7 +1132,7 @@ struct PetContentView: View {
                                     .padding(.trailing, 2)
                                     .overlay(
                                         PetMouseOverlay(
-                                            onSingleClick: { vm.openPanel(.chat) },
+                                            onSingleClick: { vm.openWorkspacePanel() },
                                             onDoubleClick: { vm.miniMode = false },
                                             onDragStart: { vm.beginDrag() },
                                             onDragDelta: { dx, dy in vm.onMoveWindowBy?(dx, dy) },
@@ -879,17 +1142,15 @@ struct PetContentView: View {
                                     )
                             }
 
-                            // 1. Quick Chat Input button
                             HoverIconButton(
                                 systemName: "text.bubble.fill",
-                                isActive: vm.activePanel == .chat,
+                                isActive: vm.activePanel == .workspace,
                                 tint: Color(red: 0.56, green: 0.52, blue: 1.0),
-                                helpText: "快捷对话 (⌥G)"
+                                helpText: "任务组与快捷修改 (⌥G)"
                             ) {
-                                vm.openPanel(.chat)
+                                vm.openWorkspacePanel()
                             }
 
-                            // 2. Voice Mode button
                             HoverIconButton(
                                 systemName: vm.voice.isRecording ? "stop.circle.fill" : "waveform",
                                 isActive: vm.activePanel == .voice || vm.voice.isRecording,
@@ -899,12 +1160,10 @@ struct PetContentView: View {
                                 if vm.voice.isRecording {
                                     vm.toggleVoiceRecording()
                                 } else {
-                                    vm.activePanel = .voice
-                                    vm.toggleVoiceRecording()
+                                    vm.openVoicePanelAndRecord()
                                 }
                             }
 
-                            // 3. Screen Context button
                             HoverIconButton(
                                 systemName: "viewfinder",
                                 isActive: vm.attachedScreenPath != nil,
@@ -914,22 +1173,14 @@ struct PetContentView: View {
                                 vm.captureScreenContext()
                             }
 
-                            // 4. Activity Tray bell button
-                            ZStack(alignment: .topTrailing) {
-                                HoverIconButton(
-                                    systemName: "bell.fill",
-                                    isActive: vm.activePanel == .activity,
-                                    tint: Color(red: 1.0, green: 0.76, blue: 0.36),
-                                    helpText: "活动与任务托盘"
-                                ) {
-                                    vm.openPanel(.activity)
-                                }
-                                if vm.unreadCount > 0 {
-                                    Circle()
-                                        .fill(Color(red: 1.0, green: 0.36, blue: 0.45))
-                                        .frame(width: 7, height: 7)
-                                        .offset(x: -1, y: 1)
-                                }
+                            HoverIconButton(
+                                systemName: "plus",
+                                isActive: false,
+                                tint: Color(red: 0.65, green: 0.62, blue: 1.0),
+                                helpText: "新建并行任务"
+                            ) {
+                                vm.createNewPetTask()
+                                vm.activePanel = .workspace
                             }
                         }
                         .padding(.horizontal, 7)
@@ -948,19 +1199,20 @@ struct PetContentView: View {
                 }
                 .frame(height: 32, alignment: .top)
             }
-            .padding(.horizontal, 8)
+            .padding(.horizontal, 6)
             .onHover { hovering in
                 vm.setHovering(hovering)
             }
         }
     }
 
-    private func liveStatusDotColor() -> Color? {
-        if vm.voice.isRecording { return Color(red: 1.0, green: 0.32, blue: 0.40) }
-        if vm.isThinking || vm.mood == .working { return Color(red: 0.45, green: 0.72, blue: 1.0) }
-        if vm.unreadCount > 0 { return Color(red: 1.0, green: 0.78, blue: 0.32) }
-        if vm.mood == .hiss { return Color(red: 1.0, green: 0.40, blue: 0.52) }
-        return nil
+    private func taskDotColor(_ state: TaskStateKind) -> Color {
+        switch state {
+        case .running: return Color(red: 0.38, green: 0.78, blue: 1.0)
+        case .done: return Color(red: 0.42, green: 0.88, blue: 0.64)
+        case .error: return Color(red: 1.0, green: 0.38, blue: 0.48)
+        case .idle: return Color(red: 0.66, green: 0.62, blue: 1.0)
+        }
     }
 
     private struct AnimTransform {
@@ -977,8 +1229,7 @@ struct PetContentView: View {
             switch mood {
             case .idle:
                 let breath = sin(t * 1.55) * 0.006
-                let floatY = sin(t * 1.55) * 0.8
-                return AnimTransform(offsetY: floatY, scaleX: 1 - breath * 0.3, scaleY: 1 + breath)
+                return AnimTransform(offsetY: sin(t * 1.55) * 0.8, scaleX: 1 - breath * 0.3, scaleY: 1 + breath)
             case .happy:
                 return AnimTransform(offsetY: -abs(sin(t * 2.8)) * 1.6, scaleX: 1.008, scaleY: 1.008)
             case .working:
@@ -1034,7 +1285,7 @@ struct HoverIconButton: View {
     }
 }
 
-// MARK: - Floating Panel View (Quick Chat / Voice Mode / Activity Tray)
+// MARK: - Unified Task Group & Inline Modify Floating Panel
 
 struct FloatingPanelView: View {
     @ObservedObject var vm: PetViewModel
@@ -1043,20 +1294,18 @@ struct FloatingPanelView: View {
     var body: some View {
         VStack(spacing: 0) {
             switch vm.activePanel {
-            case .chat:
-                chatPanel
+            case .workspace:
+                workspaceTaskPanel
             case .voice:
                 voicePanel
-            case .activity:
-                activityPanel
             case .none:
                 EmptyView()
             }
         }
-        .frame(width: 332)
+        .frame(width: 368)
         .background(
             RoundedRectangle(cornerRadius: 16, style: .continuous)
-                .fill(Color(red: 0.10, green: 0.09, blue: 0.18).opacity(0.94))
+                .fill(Color(red: 0.09, green: 0.09, blue: 0.16).opacity(0.95))
                 .overlay(
                     RoundedRectangle(cornerRadius: 16, style: .continuous)
                         .strokeBorder(
@@ -1071,7 +1320,7 @@ struct FloatingPanelView: View {
                             lineWidth: 1
                         )
                 )
-                .shadow(color: .black.opacity(0.36), radius: 14, y: 6)
+                .shadow(color: .black.opacity(0.38), radius: 16, y: 6)
         )
         .padding(8)
         .onChange(of: vm.focusInputTrigger) {
@@ -1080,7 +1329,7 @@ struct FloatingPanelView: View {
             }
         }
         .onAppear {
-            if vm.activePanel == .chat {
+            if vm.activePanel == .workspace {
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.08) {
                     isInputFocused = true
                 }
@@ -1088,25 +1337,37 @@ struct FloatingPanelView: View {
         }
     }
 
-    // 1. Quick Chat Panel
-    private var chatPanel: some View {
+    // 1. Unified Workspace + Task Group + Inline Modify Panel
+    private var workspaceTaskPanel: some View {
         VStack(spacing: 0) {
-            // Header
+            // Top Bar: Title + Workspace Open + New Task + Close
             HStack(spacing: 6) {
-                Text("✦ 哈基米快捷对话")
+                Text("✦ 工作区与任务组")
                     .font(.system(size: 12, weight: .semibold, design: .rounded))
                     .foregroundColor(.white.opacity(0.95))
+
+                if vm.runningTasksCount > 0 {
+                    Text("运行中 \(vm.runningTasksCount)")
+                        .font(.system(size: 10, weight: .semibold))
+                        .foregroundColor(Color(red: 0.52, green: 0.84, blue: 1.0))
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 2)
+                        .background(Capsule().fill(Color(red: 0.30, green: 0.52, blue: 0.95).opacity(0.28)))
+                }
+
                 Spacer()
+
                 Button {
-                    vm.startNewChat()
+                    vm.createNewPetTask()
                 } label: {
-                    Image(systemName: "square.and.pencil")
-                        .font(.system(size: 11))
-                        .foregroundColor(.white.opacity(0.72))
-                        .frame(width: 22, height: 22)
+                    Label("新任务", systemImage: "plus")
+                        .font(.system(size: 10.5, weight: .medium))
+                        .foregroundColor(.white.opacity(0.86))
+                        .padding(.horizontal, 7)
+                        .padding(.vertical, 3)
+                        .background(Capsule().fill(Color.white.opacity(0.11)))
                 }
                 .buttonStyle(.plain)
-                .help("开启新对话")
 
                 Button {
                     vm.closePanel()
@@ -1121,15 +1382,125 @@ struct FloatingPanelView: View {
             }
             .padding(.horizontal, 12)
             .padding(.top, 10)
-            .padding(.bottom, 8)
+            .padding(.bottom, 7)
 
-            // Message History (compact scrollable)
-            if !vm.messages.isEmpty || vm.isThinking {
-                Divider().background(Color.white.opacity(0.10))
+            // Horizontal Task Group Tabs (switch between Antigravity tasks & Pet threads!)
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 6) {
+                    ForEach(vm.tasks) { task in
+                        let isSel = (task.id == vm.selectedTask?.id)
+                        Button {
+                            vm.selectTask(task.id)
+                        } label: {
+                            HStack(spacing: 5) {
+                                Circle()
+                                    .fill(statusColor(task.state))
+                                    .frame(width: 6, height: 6)
+                                VStack(alignment: .leading, spacing: 0.5) {
+                                    Text(task.title)
+                                        .font(.system(size: 10.5, weight: isSel ? .semibold : .medium, design: .rounded))
+                                        .foregroundColor(.white.opacity(isSel ? 0.96 : 0.72))
+                                        .lineLimit(1)
+                                    Text(task.workspace)
+                                        .font(.system(size: 9))
+                                        .foregroundColor(.white.opacity(0.45))
+                                        .lineLimit(1)
+                                }
+                                .frame(maxWidth: 112, alignment: .leading)
+                                if task.unread {
+                                    Circle()
+                                        .fill(Color(red: 1.0, green: 0.76, blue: 0.30))
+                                        .frame(width: 5.5, height: 5.5)
+                                }
+                            }
+                            .padding(.horizontal, 8)
+                            .padding(.vertical, 5)
+                            .background(
+                                RoundedRectangle(cornerRadius: 9, style: .continuous)
+                                    .fill(isSel ? Color(red: 0.44, green: 0.42, blue: 0.90).opacity(0.45) : Color.white.opacity(0.06))
+                                    .overlay(
+                                        RoundedRectangle(cornerRadius: 9, style: .continuous)
+                                            .strokeBorder(isSel ? Color(red: 0.62, green: 0.64, blue: 1.0).opacity(0.7) : Color.clear, lineWidth: 0.9)
+                                    )
+                            )
+                        }
+                        .buttonStyle(.plain)
+                    }
+                }
+                .padding(.horizontal, 12)
+                .padding(.bottom, 8)
+            }
+
+            Divider().background(Color.white.opacity(0.10))
+
+            // Selected Task Body (Live Status / Steps / Transcript + Inline Conversation Messages)
+            if let task = vm.selectedTask {
+                // Subheader showing workspace + active status + quick jump to Antigravity
+                HStack(spacing: 6) {
+                    Image(systemName: task.isAntigravity ? "folder.fill" : "sparkles")
+                        .font(.system(size: 10))
+                        .foregroundColor(Color(red: 0.64, green: 0.76, blue: 1.0))
+                    Text("\(task.workspace) · \(task.currentAction)")
+                        .font(.system(size: 11, weight: .medium))
+                        .foregroundColor(.white.opacity(0.80))
+                        .lineLimit(1)
+                    Spacer()
+                    if task.state == .running {
+                        Text(vm.elapsedString(since: task.startedAt))
+                            .font(.system(size: 10.5, design: .monospaced))
+                            .foregroundColor(Color(red: 0.52, green: 0.84, blue: 1.0))
+                    }
+                    if task.isAntigravity {
+                        Button {
+                            vm.openApp(named: "/Applications/Antigravity.app")
+                        } label: {
+                            Text("打开主窗口 ↗")
+                                .font(.system(size: 10))
+                                .foregroundColor(Color(red: 0.72, green: 0.78, blue: 1.0))
+                        }
+                        .buttonStyle(.plain)
+                    }
+                }
+                .padding(.horizontal, 12)
+                .padding(.vertical, 6)
+                .background(Color.white.opacity(0.04))
+
                 ScrollViewReader { proxy in
                     ScrollView {
                         VStack(alignment: .leading, spacing: 8) {
-                            ForEach(vm.messages) { msg in
+                            // Live Antigravity Step Timeline (if any)
+                            if task.isAntigravity && !task.steps.isEmpty {
+                                VStack(alignment: .leading, spacing: 3) {
+                                    ForEach(task.steps.suffix(5)) { st in
+                                        Text(st.text)
+                                            .font(.system(size: 10.5, design: .monospaced))
+                                            .foregroundColor(.white.opacity(0.65))
+                                            .lineLimit(1)
+                                    }
+                                }
+                                .padding(8)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .background(RoundedRectangle(cornerRadius: 8).fill(Color.white.opacity(0.05)))
+                            }
+
+                            // Latest Antigravity Reply Preview (read-only from transcript)
+                            if task.isAntigravity && !task.agyLastReply.isEmpty {
+                                VStack(alignment: .leading, spacing: 4) {
+                                    Text("Antigravity 最新回复")
+                                        .font(.system(size: 10, weight: .semibold))
+                                        .foregroundColor(Color(red: 0.65, green: 0.76, blue: 1.0))
+                                    Text(task.agyLastReply)
+                                        .font(.system(size: 11.5, design: .rounded))
+                                        .foregroundColor(.white.opacity(0.90))
+                                        .textSelection(.enabled)
+                                }
+                                .padding(9)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .background(RoundedRectangle(cornerRadius: 10).fill(Color.white.opacity(0.08)))
+                            }
+
+                            // Inline Follow-up / Conversation Messages inside this Task
+                            ForEach(task.messages) { msg in
                                 HStack {
                                     if msg.isUser { Spacer(minLength: 36) }
                                     VStack(alignment: msg.isUser ? .trailing : .leading, spacing: 3) {
@@ -1155,11 +1526,11 @@ struct FloatingPanelView: View {
                                                 Button {
                                                     NSPasteboard.general.clearContents()
                                                     NSPasteboard.general.setString(msg.text, forType: .string)
-                                                    vm.say("已复制 ✦", duration: 1.4)
+                                                    vm.showToast("已复制 ✦")
                                                 } label: {
                                                     Label("复制", systemImage: "doc.on.doc")
                                                         .font(.system(size: 10))
-                                                        .foregroundColor(.white.opacity(0.58))
+                                                        .foregroundColor(.white.opacity(0.55))
                                                 }
                                                 .buttonStyle(.plain)
 
@@ -1168,7 +1539,7 @@ struct FloatingPanelView: View {
                                                 } label: {
                                                     Label("朗读", systemImage: "speaker.wave.2")
                                                         .font(.system(size: 10))
-                                                        .foregroundColor(.white.opacity(0.58))
+                                                        .foregroundColor(.white.opacity(0.55))
                                                 }
                                                 .buttonStyle(.plain)
                                             }
@@ -1179,23 +1550,29 @@ struct FloatingPanelView: View {
                                 }
                                 .id(msg.id)
                             }
-                            if vm.isThinking {
+
+                            if task.state == .running {
                                 HStack(spacing: 6) {
                                     ProgressView()
                                         .scaleEffect(0.6)
                                         .colorScheme(.dark)
-                                    Text("哈基米思考中…")
+                                    Text(task.currentAction)
                                         .font(.system(size: 11.5))
-                                        .foregroundColor(.white.opacity(0.68))
+                                        .foregroundColor(Color(red: 0.65, green: 0.84, blue: 1.0))
                                 }
-                                .id("thinking")
+                                .id("running-indicator")
+                            } else if !task.isAntigravity && task.messages.isEmpty {
+                                Text("直接输入问题或修改指令，回车即可在这个任务对话里继续处理 ✦")
+                                    .font(.system(size: 11.5))
+                                    .foregroundColor(.white.opacity(0.45))
+                                    .padding(.vertical, 8)
                             }
                         }
                         .padding(10)
                     }
-                    .frame(maxHeight: 200)
-                    .onChange(of: vm.messages.count) {
-                        if let last = vm.messages.last {
+                    .frame(maxHeight: 215)
+                    .onChange(of: task.messages.count) {
+                        if let last = task.messages.last {
                             withAnimation { proxy.scrollTo(last.id, anchor: .bottom) }
                         }
                     }
@@ -1226,12 +1603,12 @@ struct FloatingPanelView: View {
                 .background(Color(red: 0.20, green: 0.35, blue: 0.36).opacity(0.45))
                 .cornerRadius(8)
                 .padding(.horizontal, 10)
-                .padding(.top, 6)
+                .padding(.top, 4)
             }
 
-            Divider().background(Color.white.opacity(0.10)).padding(.top, 6)
+            Divider().background(Color.white.opacity(0.10)).padding(.top, 4)
 
-            // Input Row
+            // Persistent Inline Modify / Follow-up Composer
             HStack(spacing: 6) {
                 Button {
                     vm.captureScreenContext()
@@ -1244,18 +1621,37 @@ struct FloatingPanelView: View {
                 .buttonStyle(.plain)
                 .help("截取当前屏幕一起问")
 
-                TextField("问哈基米任何事… (回车发送)", text: $vm.inputText)
-                    .textFieldStyle(.plain)
-                    .font(.system(size: 12.5, design: .rounded))
-                    .foregroundColor(.white)
-                    .focused($isInputFocused)
-                    .onSubmit {
-                        vm.sendTextPrompt()
+                TextField(
+                    vm.selectedTask?.isAntigravity == true
+                        ? "在此任务里追加修改或追问… (回车)"
+                        : "输入问题或修改要求… (回车发送)",
+                    text: $vm.inputText
+                )
+                .textFieldStyle(.plain)
+                .font(.system(size: 12.5, design: .rounded))
+                .foregroundColor(.white)
+                .focused($isInputFocused)
+                .onSubmit {
+                    vm.sendTextPrompt()
+                }
+
+                if vm.selectedTask?.isAntigravity == true && !vm.inputText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    Button {
+                        vm.sendModifyToAntigravity()
+                    } label: {
+                        Text("去AGY")
+                            .font(.system(size: 10, weight: .semibold))
+                            .foregroundColor(.white.opacity(0.9))
+                            .padding(.horizontal, 6)
+                            .padding(.vertical, 3)
+                            .background(Capsule().fill(Color(red: 0.38, green: 0.56, blue: 0.95).opacity(0.8)))
                     }
+                    .buttonStyle(.plain)
+                    .help("复制此修改指令并立即跳到 Antigravity 粘贴发送")
+                }
 
                 Button {
-                    vm.activePanel = .voice
-                    vm.toggleVoiceRecording()
+                    vm.openVoicePanelAndRecord()
                 } label: {
                     Image(systemName: "waveform")
                         .font(.system(size: 13))
@@ -1271,13 +1667,12 @@ struct FloatingPanelView: View {
                     Image(systemName: "arrow.up.circle.fill")
                         .font(.system(size: 19))
                         .foregroundColor(
-                            (!vm.inputText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || vm.attachedScreenPath != nil) && !vm.isThinking
+                            (!vm.inputText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || vm.attachedScreenPath != nil)
                                 ? Color(red: 0.56, green: 0.54, blue: 1.0)
                                 : Color.white.opacity(0.25)
                         )
                 }
                 .buttonStyle(.plain)
-                .disabled(vm.isThinking)
             }
             .padding(.horizontal, 10)
             .padding(.vertical, 9)
@@ -1293,9 +1688,9 @@ struct FloatingPanelView: View {
                     .foregroundColor(.white.opacity(0.95))
                 Spacer()
                 Button {
-                    vm.activePanel = .chat
+                    vm.activePanel = .workspace
                 } label: {
-                    Text("切文字")
+                    Text("返回任务组")
                         .font(.system(size: 10.5))
                         .foregroundColor(.white.opacity(0.72))
                         .padding(.horizontal, 7)
@@ -1316,7 +1711,6 @@ struct FloatingPanelView: View {
                 .buttonStyle(.plain)
             }
 
-            // Voice Orb Button
             Button {
                 vm.toggleVoiceRecording()
             } label: {
@@ -1326,7 +1720,7 @@ struct FloatingPanelView: View {
                             RadialGradient(
                                 colors: vm.voice.isRecording
                                     ? [Color(red: 1.0, green: 0.35, blue: 0.45), Color(red: 0.65, green: 0.16, blue: 0.34)]
-                                    : (vm.isThinking
+                                    : (vm.isAnyTaskThinking
                                        ? [Color(red: 0.48, green: 0.58, blue: 1.0), Color(red: 0.30, green: 0.24, blue: 0.72)]
                                        : [Color(red: 0.46, green: 0.72, blue: 1.0), Color(red: 0.48, green: 0.34, blue: 0.88)]),
                                 center: .center,
@@ -1337,7 +1731,7 @@ struct FloatingPanelView: View {
                         .frame(width: 66, height: 66)
                         .shadow(color: (vm.voice.isRecording ? Color.red : Color.purple).opacity(0.45), radius: 10)
 
-                    if vm.isThinking {
+                    if vm.selectedTask?.state == .running {
                         ProgressView().colorScheme(.dark)
                     } else {
                         Image(systemName: vm.voice.isRecording ? "stop.fill" : "mic.fill")
@@ -1347,14 +1741,13 @@ struct FloatingPanelView: View {
                 }
             }
             .buttonStyle(.plain)
-            .disabled(vm.isThinking)
 
             VStack(spacing: 4) {
                 Text(vm.voice.isRecording ? "正在聆听 \(String(format: "%d:%02d", vm.voice.recordingSeconds / 60, vm.voice.recordingSeconds % 60))" : vm.voiceStatusHint)
                     .font(.system(size: 12, weight: .medium, design: .rounded))
                     .foregroundColor(.white.opacity(0.92))
 
-                if let lastReply = vm.messages.last(where: { !$0.isUser }) {
+                if let lastReply = vm.selectedTask?.messages.last(where: { !$0.isUser }) {
                     Text(lastReply.text)
                         .font(.system(size: 11.5))
                         .foregroundColor(.white.opacity(0.74))
@@ -1395,107 +1788,14 @@ struct FloatingPanelView: View {
         .padding(14)
     }
 
-    // 3. Activity Tray Panel
-    private var activityPanel: some View {
-        VStack(spacing: 0) {
-            HStack {
-                Text("🔔 活动与任务托盘")
-                    .font(.system(size: 12, weight: .semibold, design: .rounded))
-                    .foregroundColor(.white.opacity(0.95))
-                Spacer()
-                Button {
-                    vm.closePanel()
-                } label: {
-                    Image(systemName: "xmark")
-                        .font(.system(size: 10.5, weight: .bold))
-                        .foregroundColor(.white.opacity(0.65))
-                        .frame(width: 22, height: 22)
-                }
-                .buttonStyle(.plain)
-            }
-            .padding(.horizontal, 12)
-            .padding(.top, 10)
-            .padding(.bottom, 8)
-
-            Divider().background(Color.white.opacity(0.10))
-
-            ScrollView {
-                VStack(alignment: .leading, spacing: 8) {
-                    ForEach(vm.activities) { item in
-                        HStack(alignment: .top, spacing: 8) {
-                            Circle()
-                                .fill(activityColor(item.state))
-                                .frame(width: 7, height: 7)
-                                .padding(.top, 5)
-                            VStack(alignment: .leading, spacing: 2) {
-                                HStack {
-                                    Text(item.title)
-                                        .font(.system(size: 11.5, weight: .semibold))
-                                        .foregroundColor(.white.opacity(0.92))
-                                    Spacer()
-                                    Text(Self.timeFmt.string(from: item.time))
-                                        .font(.system(size: 10))
-                                        .foregroundColor(.white.opacity(0.45))
-                                }
-                                Text(item.detail)
-                                    .font(.system(size: 11))
-                                    .foregroundColor(.white.opacity(0.68))
-                                    .lineLimit(2)
-                            }
-                        }
-                        .padding(8)
-                        .background(RoundedRectangle(cornerRadius: 9).fill(Color.white.opacity(0.06)))
-                    }
-                }
-                .padding(10)
-            }
-            .frame(maxHeight: 190)
-
-            Divider().background(Color.white.opacity(0.10))
-
-            HStack(spacing: 8) {
-                Button {
-                    vm.openApp(named: "/Applications/Antigravity.app")
-                } label: {
-                    Label("打开 Antigravity", systemImage: "sparkles")
-                        .font(.system(size: 11, weight: .medium))
-                        .foregroundColor(.white.opacity(0.9))
-                        .frame(maxWidth: .infinity)
-                        .padding(.vertical, 6)
-                        .background(RoundedRectangle(cornerRadius: 8).fill(Color(red: 0.42, green: 0.40, blue: 0.88).opacity(0.75)))
-                }
-                .buttonStyle(.plain)
-
-                Button {
-                    vm.openApp(named: "/Applications/Gemini.app")
-                } label: {
-                    Label("打开 Gemini", systemImage: "star.fill")
-                        .font(.system(size: 11, weight: .medium))
-                        .foregroundColor(.white.opacity(0.85))
-                        .frame(maxWidth: .infinity)
-                        .padding(.vertical, 6)
-                        .background(RoundedRectangle(cornerRadius: 8).fill(Color.white.opacity(0.11)))
-                }
-                .buttonStyle(.plain)
-            }
-            .padding(10)
+    private func statusColor(_ st: TaskStateKind) -> Color {
+        switch st {
+        case .running: return Color(red: 0.38, green: 0.78, blue: 1.0)
+        case .done: return Color(red: 0.42, green: 0.88, blue: 0.64)
+        case .error: return Color(red: 1.0, green: 0.38, blue: 0.48)
+        case .idle: return Color(red: 0.66, green: 0.62, blue: 1.0)
         }
     }
-
-    private func activityColor(_ state: String) -> Color {
-        switch state {
-        case "working": return Color(red: 0.45, green: 0.72, blue: 1.0)
-        case "done": return Color(red: 0.42, green: 0.88, blue: 0.65)
-        case "hiss": return Color(red: 1.0, green: 0.40, blue: 0.50)
-        default: return Color(red: 0.72, green: 0.60, blue: 1.0)
-        }
-    }
-
-    private static let timeFmt: DateFormatter = {
-        let f = DateFormatter()
-        f.dateFormat = "HH:mm"
-        return f
-    }()
 }
 
 // MARK: - Compact Native Settings Window View
@@ -1521,7 +1821,6 @@ struct PetSettingsView: View {
 
             Divider()
 
-            // Size
             VStack(alignment: .leading, spacing: 6) {
                 Text("尺寸大小")
                     .font(.system(size: 12, weight: .medium))
@@ -1537,7 +1836,6 @@ struct PetSettingsView: View {
                 .labelsHidden()
             }
 
-            // Motion Style
             VStack(alignment: .leading, spacing: 6) {
                 Text("动效风格")
                     .font(.system(size: 12, weight: .medium))
@@ -1551,7 +1849,6 @@ struct PetSettingsView: View {
                 .labelsHidden()
             }
 
-            // AI Model
             VStack(alignment: .leading, spacing: 6) {
                 Text("对话模型")
                     .font(.system(size: 12, weight: .medium))
@@ -1566,11 +1863,11 @@ struct PetSettingsView: View {
 
             Divider()
 
-            // Toggles
             VStack(alignment: .leading, spacing: 8) {
-                Toggle("Mini 模式（隐藏角色，仅保留快捷条）", isOn: $vm.miniMode)
-                Toggle("窗口悬浮置顶", isOn: $vm.alwaysOnTop)
-                Toggle("Antigravity 后台状态联动", isOn: $vm.agySyncEnabled)
+                Toggle("常态显示顶部工作区与任务栏", isOn: $vm.alwaysShowTaskBar)
+                Toggle("Mini 模式（隐藏角色，仅保留任务条）", isOn: $vm.miniMode)
+                Toggle("窗口悬浮置顶（显示桌面时也保留）", isOn: $vm.alwaysOnTop)
+                Toggle("Antigravity 实时任务联动", isOn: $vm.agySyncEnabled)
                 Toggle("桌面自由散步", isOn: $vm.wanderEnabled)
             }
             .font(.system(size: 12.5))
@@ -1584,7 +1881,7 @@ struct PetSettingsView: View {
             }
         }
         .padding(18)
-        .frame(width: 340)
+        .frame(width: 350)
     }
 }
 
@@ -1722,6 +2019,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var settingsWindow: NSWindow?
     private var statusItem: NSStatusItem!
     private var hotKeyRef: EventHotKeyRef?
+    private var cancellables: Set<AnyCancellable> = []
     private let vm = PetViewModel()
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -1735,18 +2033,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func petWindowSize() -> NSSize {
         if vm.miniMode {
-            return NSSize(width: 170, height: 48)
+            return NSSize(width: 212, height: 92)
         }
         let s = vm.petSize.rawValue
-        return NSSize(width: max(148, s + 28), height: s + 66)
+        return NSSize(width: max(212, s + 24), height: s + 88)
     }
 
     private func setupPetWindow() {
         let size = petWindowSize()
         let screenFrame = NSScreen.main?.visibleFrame ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
         let origin = NSPoint(
-            x: screenFrame.maxX - size.width - 20,
-            y: screenFrame.minY + 18
+            x: screenFrame.maxX - size.width - 18,
+            y: screenFrame.minY + 16
         )
 
         petWindow = PetWindow(
@@ -1776,7 +2074,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func setupPanelWindow() {
         panelWindow = FloatingInputPanel(
-            contentRect: NSRect(x: 0, y: 0, width: 348, height: 320),
+            contentRect: NSRect(x: 0, y: 0, width: 384, height: 360),
             styleMask: [.borderless, .nonactivatingPanel],
             backing: .buffered,
             defer: false
@@ -1803,8 +2101,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guard let hosting = panelWindow.contentView else { return }
         hosting.layoutSubtreeIfNeeded()
         let fitting = hosting.fittingSize
-        let w = max(348, fitting.width)
-        let h = max(120, min(390, fitting.height))
+        let w = max(384, fitting.width)
+        let h = max(160, min(440, fitting.height))
 
         let petFrame = petWindow.frame
         let screen = petWindow.screen?.visibleFrame ?? NSScreen.main?.visibleFrame ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
@@ -1812,7 +2110,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         var px = petFrame.midX - w / 2
         px = max(screen.minX + 12, min(screen.maxX - w - 12, px))
 
-        // Prefer directly above the pet; if near top edge, place below
         var py = petFrame.maxY + 4
         if py + h > screen.maxY - 12 {
             py = max(screen.minY + 12, petFrame.minY - h - 4)
@@ -1862,7 +2159,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             if mode == .none {
                 self.panelWindow.orderOut(nil)
             } else {
-                // Re-layout twice (immediately + next runloop) so dynamic content height snaps cleanly
                 self.positionPanelWindow()
                 NSApp.activate(ignoringOtherApps: true)
                 self.panelWindow.makeKeyAndOrderFront(nil)
@@ -1873,8 +2169,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             self.refreshMenuBar()
         }
 
-        // Also keep panel height updated when chat messages arrive
-        vm.$messages.receive(on: DispatchQueue.main).sink { [weak self] _ in
+        vm.$tasks.receive(on: DispatchQueue.main).sink { [weak self] _ in
             guard let self, self.vm.activePanel != .none else { return }
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
                 self.positionPanelWindow()
@@ -1882,27 +2177,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }.store(in: &cancellables)
     }
 
-    private var cancellables: Set<AnyCancellable> = []
-
     private func registerGlobalHotKey() {
-        // Option + G (keyCode 5 = 'G') — avoids conflicting with Spotlight / ChatGPT Option+Space
         globalHotKeyCallback = { [weak self] in
             guard let self else { return }
             if !self.vm.isVisible {
                 self.vm.isVisible = true
                 self.petWindow.orderFrontRegardless()
             }
-            if self.vm.activePanel == .chat {
+            if self.vm.activePanel == .workspace {
                 self.vm.closePanel()
             } else {
-                self.vm.openPanel(.chat)
+                self.vm.openWorkspacePanel()
             }
         }
 
         var eventType = EventTypeSpec(eventClass: OSType(kEventClassKeyboard), eventKind: UInt32(kEventHotKeyPressed))
         InstallEventHandler(GetApplicationEventTarget(), hotKeyHandler, 1, &eventType, nil, nil)
 
-        let hotKeyID = EventHotKeyID(signature: OSType(0x47504554), id: 1) // 'GPET'
+        let hotKeyID = EventHotKeyID(signature: OSType(0x47504554), id: 1)
         RegisterEventHotKey(UInt32(kVK_ANSI_G), UInt32(optionKey), hotKeyID, GetApplicationEventTarget(), 0, &hotKeyRef)
     }
 
@@ -1911,7 +2203,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if let button = statusItem.button {
             button.title = "✦"
             button.font = NSFont.systemFont(ofSize: 15, weight: .semibold)
-            button.toolTip = "Gemini 哈基米桌宠 (⌥G 快捷对话)"
+            button.toolTip = "Gemini 哈基米桌宠 (⌥G 工作区与任务组)"
         }
         statusItem.menu = buildStatusBarMenu()
     }
@@ -1931,7 +2223,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         return menu
     }
 
-    /// Clean compact menu for the top macOS Menu Bar icon
     private func buildStatusBarMenu() -> NSMenu {
         let menu = NSMenu()
 
@@ -1943,7 +2234,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         toggleItem.target = self
         menu.addItem(toggleItem)
 
-        let chatItem = NSMenuItem(title: "快捷对话 (⌥G)", action: #selector(openChatAction), keyEquivalent: "")
+        let chatItem = NSMenuItem(title: "工作区与任务组 (⌥G)", action: #selector(openWorkspaceAction), keyEquivalent: "")
         chatItem.target = self
         menu.addItem(chatItem)
 
@@ -1985,7 +2276,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         )
         let hosting = NSHostingView(rootView: view)
         let win = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 340, height: 390),
+            contentRect: NSRect(x: 0, y: 0, width: 350, height: 420),
             styleMask: [.titled, .closable],
             backing: .buffered,
             defer: false
@@ -2000,9 +2291,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         win.makeKeyAndOrderFront(nil)
     }
 
-    @objc private func openChatAction() {
+    @objc private func openWorkspaceAction() {
         if !vm.isVisible { toggleVisibility() }
-        vm.openPanel(.chat)
+        vm.openWorkspacePanel()
     }
 
     @objc private func toggleVisibility() {

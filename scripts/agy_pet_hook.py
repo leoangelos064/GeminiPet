@@ -8,9 +8,30 @@ and permission policies are never altered.
 
 import json
 import os
+import subprocess
 import sys
 import time
 from pathlib import Path
+
+
+def ensure_pet_running():
+    app_path = Path("/Applications/GeminiPet.app")
+    if not app_path.exists():
+        return
+    try:
+        chk = subprocess.run(
+            ["pgrep", "-f", "GeminiPet.app/Contents/MacOS/GeminiPet"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        if chk.returncode != 0:
+            subprocess.Popen(
+                ["open", "-g", str(app_path)],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+    except Exception:
+        pass
 
 
 def summarize_tool(tool_call: dict) -> str:
@@ -137,6 +158,11 @@ def main():
 
     legacy_state = None
     legacy_msg = None
+
+    if event == "SessionStart":
+        ensure_pet_running()
+        print("{}")
+        return
 
     if event == "PreInvocation":
         if task.get("state") != "running":

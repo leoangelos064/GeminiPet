@@ -354,6 +354,9 @@ final class PetViewModel: ObservableObject {
     }
     @Published var wanderEnabled: Bool = false
     @Published var agySyncEnabled: Bool = true
+    @Published var quitWithAntigravity: Bool = UserDefaults.standard.object(forKey: "quitWithAntigravity") as? Bool ?? true {
+        didSet { UserDefaults.standard.set(quitWithAntigravity, forKey: "quitWithAntigravity") }
+    }
     @Published var showTaskBanner: Bool = true
     @Published var launchAtLogin: Bool = LaunchAgentHelper.isEnabled {
         didSet { LaunchAgentHelper.setEnabled(launchAtLogin) }
@@ -1843,6 +1846,7 @@ struct PetSettingsView: View {
                 Toggle("Mini 模式（隐藏角色，仅保留快捷条）", isOn: $vm.miniMode)
                 Toggle("窗口悬浮置顶（点按桌面时也留在前台）", isOn: $vm.alwaysOnTop)
                 Toggle("Antigravity 实时任务联动", isOn: $vm.agySyncEnabled)
+                Toggle("随 Antigravity 退出自动关闭", isOn: $vm.quitWithAntigravity)
                 Toggle("桌面自由散步", isOn: $vm.wanderEnabled)
                 Toggle("开机自动启动", isOn: $vm.launchAtLogin)
             }
@@ -2006,6 +2010,35 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         setupStatusBar()
         bindCallbacks()
         registerGlobalHotKey()
+        observeAntigravityLifecycle()
+    }
+
+    private func observeAntigravityLifecycle() {
+        let agyBundleIDs: Set<String> = [
+            "com.google.antigravity",
+            "com.google.antigravity-ide"
+        ]
+        NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.didTerminateApplicationNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] notif in
+            guard let app = notif.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication,
+                  let bid = app.bundleIdentifier,
+                  agyBundleIDs.contains(bid) else {
+                return
+            }
+            Task { @MainActor in
+                guard let self, self.vm.quitWithAntigravity else { return }
+                let stillRunning = NSWorkspace.shared.runningApplications.contains {
+                    guard let id = $0.bundleIdentifier else { return false }
+                    return agyBundleIDs.contains(id) && !$0.isTerminated
+                }
+                if !stillRunning {
+                    NSApp.terminate(nil)
+                }
+            }
+        }
     }
 
     private func petWindowSize() -> NSSize {

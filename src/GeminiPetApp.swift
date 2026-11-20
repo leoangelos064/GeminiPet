@@ -336,6 +336,8 @@ enum LaunchAgentHelper {
 final class PetViewModel: ObservableObject {
     @Published var mood: PetMood = .idle
     @Published var isHovering: Bool = false
+    @Published var hoverLeanDegrees: Double = 0
+    @Published var hoverPopScale: CGFloat = 1.0
     @Published var activePanel: ActivePanelMode = .none {
         didSet { onPanelModeChanged?(activePanel) }
     }
@@ -400,6 +402,7 @@ final class PetViewModel: ObservableObject {
     var onPanelModeChanged: ((ActivePanelMode) -> Void)?
 
     private var lastInteractionDate = Date()
+    private var lastHoverGreetDate: Date = .distantPast
     private var recentPokeTimestamps: [Date] = []
     private var toastDismissTask: Task<Void, Never>?
     private var doneAutoHideTask: Task<Void, Never>?
@@ -414,6 +417,12 @@ final class PetViewModel: ObservableObject {
 
     private let happyLines = ["呼噜~ ✦", "摸摸头 💗", "在呢喵~"]
     private let hissLines = ["哈——！💢", "别一直戳啦！", "炸毛了喵 💢"]
+    private let hoverGreetLines = [
+        "嗨~ 找哈基米吗？✦",
+        "在呢喵~ 要聊点什么？",
+        "哈基米随时待命 ✦",
+        "点一下可以摸摸头哦~"
+    ]
 
     init() {
         loadSprites()
@@ -748,12 +757,34 @@ final class PetViewModel: ObservableObject {
     func setHovering(_ hovering: Bool) {
         hoverHideTask?.cancel()
         if hovering {
-            withAnimation(.easeOut(duration: 0.14)) {
+            let wasHovering = isHovering
+            withAnimation(.spring(response: 0.28, dampingFraction: 0.65)) {
                 isHovering = true
+                hoverPopScale = 1.055
+            }
+            if !wasHovering {
+                lastInteractionDate = Date()
+                // Wake up gently if sleeping, or greet cheerfully if idle!
+                if mood == .sleep {
+                    setMood(.happy, autoResetAfter: 2.0)
+                    showToast("唔嗯…你来啦 ✦", duration: 2.2)
+                    lastHoverGreetDate = Date()
+                } else if mood == .idle && activePanel == .none && runningTasksCount == 0 {
+                    let now = Date()
+                    if now.timeIntervalSince(lastHoverGreetDate) > 8.0 {
+                        lastHoverGreetDate = now
+                        setMood(.happy, autoResetAfter: 1.8)
+                        showToast(timeAwareGreeting(), duration: 2.2)
+                    }
+                }
             }
         } else {
+            withAnimation(.easeOut(duration: 0.22)) {
+                hoverLeanDegrees = 0
+                hoverPopScale = 1.0
+            }
             hoverHideTask = Task { [weak self] in
-                try? await Task.sleep(nanoseconds: 650_000_000)
+                try? await Task.sleep(nanoseconds: 550_000_000)
                 guard !Task.isCancelled else { return }
                 await MainActor.run {
                     if let self, self.activePanel == .none && !self.voice.isRecording {
@@ -764,6 +795,28 @@ final class PetViewModel: ObservableObject {
                 }
             }
         }
+    }
+
+    func updateHoverPointer(normalizedX: CGFloat) {
+        // normalizedX in [-1, 1]: gently lean head toward user's cursor!
+        let clamped = max(-1.0, min(1.0, Double(normalizedX)))
+        withAnimation(.easeOut(duration: 0.12)) {
+            hoverLeanDegrees = clamped * 4.5
+        }
+    }
+
+    private func timeAwareGreeting() -> String {
+        let hour = Calendar.current.component(.hour, from: Date())
+        if Bool.random() {
+            switch hour {
+            case 5..<11: return "早安呀~ ✦"
+            case 11..<14: return "中午好喵~ ✦"
+            case 14..<18: return "下午好，需要帮忙吗？✦"
+            case 18..<23: return "晚上好喵~ ✦"
+            default: return "这么晚还在忙呀，注意休息 ✦"
+            }
+        }
+        return hoverGreetLines.randomElement()!
     }
 
     // MARK: - Inline Send / Modify
@@ -1178,10 +1231,20 @@ struct PetContentView: View {
                                 .interpolation(.high)
                                 .aspectRatio(contentMode: .fit)
                                 .frame(width: s, height: s)
-                                .scaleEffect(x: (vm.isFacingLeft ? -1 : 1) * anim.scaleX, y: anim.scaleY)
-                                .rotationEffect(.degrees(anim.rotation + vm.dragTiltDegrees))
-                                .offset(x: anim.offsetX, y: anim.offsetY)
-                                .shadow(color: Color.black.opacity(0.22), radius: 4, x: 0, y: 2.5)
+                                .scaleEffect(
+                                    x: (vm.isFacingLeft ? -1 : 1) * anim.scaleX * vm.hoverPopScale,
+                                    y: anim.scaleY * vm.hoverPopScale
+                                )
+                                .rotationEffect(.degrees(anim.rotation + vm.dragTiltDegrees + vm.hoverLeanDegrees))
+                                .offset(x: anim.offsetX, y: anim.offsetY - (vm.isHovering ? 2.5 : 0))
+                                .shadow(
+                                    color: vm.isHovering
+                                        ? Color(red: 0.62, green: 0.56, blue: 1.0).opacity(0.45)
+                                        : Color.black.opacity(0.22),
+                                    radius: vm.isHovering ? 8 : 4,
+                                    x: 0,
+                                    y: vm.isHovering ? 3 : 2.5
+                                )
                         }
                     }
                     .frame(width: s + 8, height: s + 4)
@@ -1196,7 +1259,9 @@ struct PetContentView: View {
                                 vm.onMoveWindowBy?(dx, dy)
                             },
                             onDragEnd: { vm.endDrag() },
-                            onRightClick: onContextMenuRequested
+                            onRightClick: onContextMenuRequested,
+                            onHoverChange: { hovering in vm.setHovering(hovering) },
+                            onHoverMove: { nx in vm.updateHoverPointer(normalizedX: nx) }
                         )
                     )
                 }
@@ -1891,6 +1956,8 @@ struct PetMouseOverlay: NSViewRepresentable {
     let onDragDelta: (CGFloat, CGFloat) -> Void
     let onDragEnd: () -> Void
     let onRightClick: (NSEvent) -> Void
+    var onHoverChange: ((Bool) -> Void)? = nil
+    var onHoverMove: ((CGFloat) -> Void)? = nil
 
     func makeNSView(context: Context) -> PetInteractionNSView {
         let v = PetInteractionNSView()
@@ -1900,6 +1967,8 @@ struct PetMouseOverlay: NSViewRepresentable {
         v.onDragDelta = onDragDelta
         v.onDragEnd = onDragEnd
         v.onRightClick = onRightClick
+        v.onHoverChange = onHoverChange
+        v.onHoverMove = onHoverMove
         return v
     }
 
@@ -1910,6 +1979,8 @@ struct PetMouseOverlay: NSViewRepresentable {
         nsView.onDragDelta = onDragDelta
         nsView.onDragEnd = onDragEnd
         nsView.onRightClick = onRightClick
+        nsView.onHoverChange = onHoverChange
+        nsView.onHoverMove = onHoverMove
     }
 }
 
@@ -1920,13 +1991,48 @@ final class PetInteractionNSView: NSView {
     var onDragDelta: ((CGFloat, CGFloat) -> Void)?
     var onDragEnd: (() -> Void)?
     var onRightClick: ((NSEvent) -> Void)?
+    var onHoverChange: ((Bool) -> Void)?
+    var onHoverMove: ((CGFloat) -> Void)?
 
     private var mouseDownScreenPoint: NSPoint = .zero
     private var lastScreenPoint: NSPoint = .zero
     private var hasMovedBeyondDragThreshold = false
     private var pendingSingleClick: DispatchWorkItem?
+    private var trackingArea: NSTrackingArea?
 
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        if let old = trackingArea {
+            removeTrackingArea(old)
+        }
+        let area = NSTrackingArea(
+            rect: bounds,
+            options: [.mouseEnteredAndExited, .mouseMoved, .activeAlways, .inVisibleRect],
+            owner: self,
+            userInfo: nil
+        )
+        addTrackingArea(area)
+        trackingArea = area
+    }
+
+    override func mouseEntered(with event: NSEvent) {
+        NSCursor.pointingHand.set()
+        onHoverChange?(true)
+    }
+
+    override func mouseMoved(with event: NSEvent) {
+        let pt = convert(event.locationInWindow, from: nil)
+        guard bounds.width > 1 else { return }
+        let normalizedX = ((pt.x / bounds.width) - 0.5) * 2.0
+        onHoverMove?(normalizedX)
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        NSCursor.arrow.set()
+        onHoverChange?(false)
+    }
 
     override func mouseDown(with event: NSEvent) {
         mouseDownScreenPoint = NSEvent.mouseLocation
@@ -2084,6 +2190,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         petWindow.hasShadow = false
         petWindow.hidesOnDeactivate = false
         petWindow.canHide = false
+        petWindow.acceptsMouseMovedEvents = true
         petWindow.level = .statusBar
         petWindow.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary, .ignoresCycle]
         petWindow.isMovableByWindowBackground = false

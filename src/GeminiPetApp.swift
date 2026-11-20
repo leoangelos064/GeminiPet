@@ -110,12 +110,12 @@ enum TaskSource: String, CaseIterable {
 
     var shortBadge: String {
         switch self {
-        case .antigravity: return "AGY"
-        case .antigravityIDE: return "IDE"
-        case .geminiAgent: return "Gemini"
+        case .antigravity: return "Antigravity"
+        case .antigravityIDE: return "AGY IDE"
+        case .geminiAgent: return "Gemini·Agent"
         case .geminiVideo: return "Gemini·视频"
         case .geminiChat: return "Gemini·对话"
-        case .petQuickChat: return "API"
+        case .petQuickChat: return "API 快捷"
         }
     }
 
@@ -1516,30 +1516,32 @@ struct PetContentView: View {
                                         .scaleEffect(bt.state == .running ? (1.0 + sin(t * 5.5) * 0.2) : 1.0)
 
                                     Text(bt.source.shortBadge)
-                                        .font(.system(size: 8.5, weight: .bold, design: .rounded))
+                                        .font(.system(size: 9.5, weight: .bold, design: .rounded))
                                         .foregroundColor(.white)
-                                        .padding(.horizontal, 4.5)
-                                        .padding(.vertical, 1)
-                                        .background(Capsule().fill(bt.source.badgeColor.opacity(0.82)))
+                                        .fixedSize(horizontal: true, vertical: false)
+                                        .padding(.horizontal, 6)
+                                        .padding(.vertical, 1.5)
+                                        .background(Capsule().fill(bt.source.badgeColor.opacity(0.88)))
 
-                                    Text(bt.state == .running
-                                         ? bt.currentAction
-                                         : (bt.state == .error ? bt.currentAction : "\(bt.title)·完成"))
+                                    Text(bannerBodyText(for: bt))
                                         .font(.system(size: 10.5, weight: .medium, design: .rounded))
-                                        .foregroundColor(.white.opacity(0.94))
+                                        .foregroundColor(.white.opacity(0.95))
                                         .lineLimit(1)
+                                        .truncationMode(.tail)
 
                                     if bt.state == .running {
                                         Text(vm.elapsedString(since: bt.startedAt))
                                             .font(.system(size: 9.5, design: .monospaced))
                                             .foregroundColor(Color(red: 0.62, green: 0.84, blue: 1.0))
+                                            .fixedSize(horizontal: true, vertical: false)
                                     }
 
                                     if vm.runningTasksCount > 1 {
                                         Text("+\(vm.runningTasksCount - 1)")
                                             .font(.system(size: 9, weight: .semibold))
                                             .foregroundColor(.white.opacity(0.88))
-                                            .padding(.horizontal, 4)
+                                            .fixedSize(horizontal: true, vertical: false)
+                                            .padding(.horizontal, 4.5)
                                             .padding(.vertical, 1)
                                             .background(Capsule().fill(Color.white.opacity(0.16)))
                                     }
@@ -1554,16 +1556,17 @@ struct PetContentView: View {
                                 Image(systemName: "xmark")
                                     .font(.system(size: 8.5, weight: .bold))
                                     .foregroundColor(.white.opacity(0.55))
-                                    .frame(width: 15, height: 15)
+                                    .frame(width: 16, height: 16)
                                     .contentShape(Rectangle())
                             }
                             .buttonStyle(.plain)
+                            .fixedSize(horizontal: true, vertical: false)
                             .help("关闭任务提示")
                         }
                         .padding(.leading, 8)
                         .padding(.trailing, 6)
                         .padding(.vertical, 5)
-                        .frame(maxWidth: 236)
+                        .frame(maxWidth: 304)
                         .background(
                             Capsule()
                                 .fill(Color(red: 0.10, green: 0.09, blue: 0.18).opacity(0.92))
@@ -1716,6 +1719,21 @@ struct PetContentView: View {
             .onHover { hovering in
                 vm.setHovering(hovering)
             }
+        }
+    }
+
+    private func bannerBodyText(for task: PetTaskThread) -> String {
+        let ws = task.workspace.trimmingCharacters(in: .whitespacesAndNewlines)
+        let showWS = !ws.isEmpty && ws != "Gemini" && ws != "API" && ws != "默认工作区"
+        let prefix = showWS ? "\(ws) · " : ""
+        switch task.state {
+        case .running:
+            let act = task.currentAction.isEmpty ? "思考中…" : task.currentAction
+            return "\(prefix)\(act)"
+        case .error:
+            return "\(prefix)\(task.currentAction)"
+        default:
+            return "\(prefix)\(task.title) · 完成"
         }
     }
 
@@ -2573,10 +2591,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func petWindowSize() -> NSSize {
         if vm.miniMode {
-            return NSSize(width: 248, height: 72)
+            return NSSize(width: 316, height: 72)
         }
         let s = vm.petSize.rawValue
-        return NSSize(width: max(248, s + 24), height: s + 72)
+        return NSSize(width: max(316, s + 24), height: s + 72)
     }
 
     private func setupPetWindow() {

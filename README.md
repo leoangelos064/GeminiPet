@@ -33,12 +33,12 @@
 ## 🚀 快速安装与构建
 
 ### 方式一：直接下载 Release 成品包
-前往 [Releases](https://github.com/leoangelos065/GeminiPet/releases) 下载最新的 `GeminiPet-macOS.zip`，解压后将 `GeminiPet.app` 拖入 `/Applications/` 双击运行即可。
+如已在仓库中发布 Release，可直接下载 `GeminiPet-macOS.zip`，解压后将 `GeminiPet.app` 拖入 `/Applications/` 双击运行即可。
 
 ### 方式二：从源码一键编译
 
 ```bash
-git clone https://github.com/leoangelos065/GeminiPet.git
+git clone https://github.com/leoangelos064/GeminiPet.git
 cd GeminiPet
 chmod +x scripts/build_app.sh
 ./scripts/build_app.sh
